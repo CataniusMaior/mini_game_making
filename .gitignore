@@ -1,3 +1,6 @@
 node_modules/
 .DS_Store
 *.log
+
+# personal Docker settings (see compose.override.example.yaml)
+compose.override.yaml

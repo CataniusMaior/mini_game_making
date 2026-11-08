@@ -4,11 +4,101 @@
 
 グリッドに施設を並べて宇宙船を運営する、かつてのブラウザゲーム（Nussy Game『Lonely Colony』など）に着想を得たオリジナル作品です。名前・設定・モジュールの構成・数値・見た目はすべて独自のものです。
 
+## 始め方
+
+次のどれでも遊べます。進行状況はブラウザの localStorage に自動保存され、「続きから」で再開できます。
+
+- **Docker で遊ぶ**（Node.js などを入れずに、`http://localhost:9410/` で遊ぶ）：下の「Docker で遊ぶ」
+- **ファイルを直接開く**：`index.html` をブラウザで開くだけ。GitHub Pages などの静的ホスティングにもそのまま置けます。
+- **Node.js で動かす**：`npm start`（または `node server.mjs`）で `http://localhost:9410/` に配信します。依存パッケージはありません。
+
+URL に `?seed=123` を付けると、航路と乱数を固定して始められます。
+
+### Docker で遊ぶ
+
+Node.js をパソコンに入れずに、Docker のコンテナの中でゲームのサーバーを動かし、ふだんのブラウザで遊べます。
+コンテナはゲームのファイルを配信するだけで、セーブはブラウザの中に残ります。
+
+1. Docker を入れる。
+   - Windows・Mac: [Docker Desktop](https://www.docker.com/products/docker-desktop/) をインストールして起動しておく。
+   - Linux: Docker Engine と Compose プラグインを入れる（[公式の手順](https://docs.docker.com/engine/install/)）。
+2. ターミナル（Windows では PowerShell）で、次のコマンドが動くことを確かめる。
+
+   ```bash
+   docker compose version
+   ```
+
+3. このリポジトリを取ってきて、そのフォルダ（`compose.yaml` があるフォルダ）に移る。以下のコマンドはすべてこのフォルダで実行します。
+
+#### Windows：ダブルクリックで遊ぶ（いちばんかんたん）
+
+リポジトリのフォルダの **`driftark-start.bat`** をダブルクリックすると、次のことを順に行います。
+
+1. Docker Desktop が動いていなければ起動して待つ。
+2. ゲームを最新の版に更新する（`git pull`。[Git for Windows](https://gitforwindows.org/) で取ってきたフォルダのとき）。
+3. イメージを作り直す（`docker compose build`。変わった部分だけ作り直すので、2回目からは速い）。
+4. ゲームのサーバーを起動し（`docker compose up`）、準備ができたらふだんのブラウザで `http://localhost:9410/` を開く。
+
+終わるときは、黒い画面で `Ctrl`+`C` を押します。画面を閉じて終わってしまったときは、**`driftark-stop.bat`** でコンテナを片付けます。
+
+#### コマンドで動かす（Windows・Mac・Linux）
+
+```bash
+docker compose up --build
+```
+
+準備ができたら、ブラウザで `http://localhost:9410/` を開きます。初回はイメージ（Node.js の小さなイメージ）のダウンロードで1〜2分かかります。
+終わるときは `Ctrl`+`C`、そのあと次のコマンドでコンテナを片付けます。
+
+```bash
+docker compose down
+```
+
+ゲームのファイルはイメージの中にコピーされるので、`git pull` などで更新したら `docker compose up --build`（または `docker compose build`）で作り直してください。
+
+compose を使わずに動かすこともできます。
+
+```bash
+docker build -t drift-ark .
+```
+
+```bash
+docker run --rm -it --init -p 127.0.0.1:9410:9410 drift-ark
+```
+
+#### 自分用の設定（ポート・スマートフォンから遊ぶ・編集しながら遊ぶ）
+
+設定は `compose.yaml` ではなく、`compose.override.example.yaml` をコピーして作る `compose.override.yaml` に書きます
+（git が無視するので、更新とぶつかりません。`docker compose` も `driftark-start.bat` も自動で読み込みます）。
+
+```bash
+cp compose.override.example.yaml compose.override.yaml
+```
+
+（Windows のコマンドプロンプトでは `copy compose.override.example.yaml compose.override.yaml`）
+
+使いたい設定の行の先頭の `#` を外します。
+
+- **別のポートで遊ぶ**：`ports` の2行。`"127.0.0.1:9500:9410"` なら `http://localhost:9500/` を開きます。
+- **スマートフォンなど、同じネットワークのほかの端末から遊ぶ**：`ports` を `"9410:9410"` にして、その端末で
+  `http://<このパソコンのIPアドレス>:9410/` を開きます（つながらないときは、パソコンのファイアウォールで 9410 番を許可）。
+  同じネットワークの誰でも開けるようになるので、家のネットワークなど信頼できる場所でだけ使ってください。
+- **ゲームを編集しながら遊ぶ**：`volumes` の4行。このフォルダのファイルをそのまま配信するので、編集したらページを再読み込みするだけで反映されます（作り直し不要）。
+
+#### セーブについて
+
+セーブはコンテナではなく **ブラウザの中** に、開いたアドレスごとに保存されます。
+
+- コンテナを消したり作り直したりしても、セーブは消えません。
+- ポートを変える（`localhost:9410` → `localhost:9500`）、別のブラウザや端末で開く、`index.html` を直接開く、のどれでも、セーブは別々になります。
+
+#### うまくいかないとき
+
+- **`docker compose` が見つからない**：古い Docker では `docker-compose`（ハイフン付き）の場合があります。Docker Desktop を新しくするか、Compose プラグインを入れてください。
+- **`port is already allocated` と出る／ポート 9410 がほかのアプリで使われている**：前に起動したコンテナが残っていれば `docker compose down` で片付けます。ほかのアプリが使っているときは、`compose.override.yaml` でポートを変えます（上の「自分用の設定」）。
+- **更新したのに画面が変わらない**：`docker compose up --build` で作り直してから、ページを再読み込みしてください。
+
 ## 遊び方
-
-`index.html` をブラウザで開くだけで遊べます。GitHub Pages などの静的ホスティングにそのまま置くこともできます。進行状況はブラウザの localStorage に自動保存され、「続きから」で再開できます。
-
-- URL に `?seed=123` を付けると、航路と乱数を固定して始められます。
 
 ### 目的
 
@@ -46,18 +136,24 @@
 ## ファイル構成
 
 ```
-index.html        画面の骨組み
-css/style.css     スタイル
-js/data.js        モジュール・研究・宙域・数値の定義（バランス調整はここ）
-js/game.js        ゲームロジック（DOM 非依存。Node からも読み込める）
-js/ui.js          描画と操作
-tests/            Node の組み込みテストランナー用テスト
-tools/bot.js      バランス確認用の自動プレイボット
+index.html                    画面の骨組み
+css/style.css                 スタイル
+js/data.js                    モジュール・研究・宙域・数値の定義（バランス調整はここ）
+js/game.js                    ゲームロジック（DOM 非依存。Node からも読み込める）
+js/ui.js                      描画と操作
+server.mjs                    ゲームを配信する小さなウェブサーバー（npm start・Docker で使う）
+Dockerfile                    Docker イメージ（Node.js + server.mjs + ゲームのファイル）
+compose.yaml                  docker compose の設定
+compose.override.example.yaml 自分用の設定の例（コピーして compose.override.yaml に）
+driftark-start.bat            Windows でダブルクリックして遊ぶ
+driftark-stop.bat             Windows でコンテナを止めて片付ける
+tests/                        Node の組み込みテストランナー用テスト
+tools/bot.js                  バランス確認用の自動プレイボット
 ```
 
 ## 開発
 
-Node.js 18 以上で、テストとバランス確認を実行できます（ゲーム自体には不要です）。
+Node.js 18 以上で、テストとバランス確認を実行できます（ゲームを遊ぶだけなら不要です）。
 
 ```bash
 npm test

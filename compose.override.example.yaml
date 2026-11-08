@@ -1,0 +1,22 @@
+# Personal settings for Docker (docker compose and driftark-start.bat read them).
+# Copy this file to compose.override.yaml and edit that copy: it is yours
+# (git ignores it), so updates (git pull) never clash with it.
+#
+#   copy compose.override.example.yaml compose.override.yaml      (Windows)
+#   cp compose.override.example.yaml compose.override.yaml        (Mac / Linux)
+#
+# To use a setting, remove the "#" at the very start of its lines.
+services:
+  game:
+    # another port on this computer (then open http://localhost:9500/), or
+    # "9410:9410" to play from other devices on the same network, such as a
+    # phone (open http://<this computer's IP address>:9410/ there)
+#    ports: !override
+#      - "127.0.0.1:9500:9410"
+
+    # use the files in this folder instead of the copies in the image, so
+    # edits to the game show up after reloading the page (no rebuild)
+#    volumes:
+#      - ./index.html:/app/index.html:ro
+#      - ./css:/app/css:ro
+#      - ./js:/app/js:ro

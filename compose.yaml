@@ -1,0 +1,15 @@
+# Play DRIFT ARK with Docker:
+#
+#   docker compose up --build      then open http://localhost:9410/ in your browser
+#
+# Stop with Ctrl+C, then clean up with `docker compose down`.
+# Personal settings (another port, playing from a phone on the same network,
+# editing the game while it runs) go in compose.override.yaml: see
+# compose.override.example.yaml.
+services:
+  game:
+    build: .
+    image: drift-ark
+    init: true # Ctrl+C stops the server
+    ports:
+      - "127.0.0.1:9410:9410" # the game, reachable from this computer only
