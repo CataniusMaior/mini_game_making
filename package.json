@@ -1,0 +1,10 @@
+{
+  "name": "drift-ark",
+  "version": "1.0.0",
+  "private": true,
+  "description": "グリッドにモジュールを配置して世代船を運営するターン制シミュレーション（ブラウザゲーム）",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "balance": "node tools/bot.js 100 smart && node tools/bot.js 10 idle"
+  }
+}

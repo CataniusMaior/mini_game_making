@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DRIFT ARK — 世代船グリッド航行記</title>
+  <meta name="description" content="グリッドにモジュールを配置して世代船を運営し、遥かな新天地を目指すターン制シミュレーション。">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">DRIFT ARK</span>
+        <span class="sub">世代船グリッド航行記</span>
+      </div>
+      <div class="turninfo">ターン <b id="turn">1</b></div>
+      <div class="topbtns">
+        <button type="button" class="btn ghost" id="btn-help">遊び方</button>
+        <button type="button" class="btn ghost" id="btn-menu">メニュー</button>
+      </div>
+    </header>
+
+    <section class="panel route" id="route" aria-label="航路"></section>
+
+    <section class="stats" id="stats" aria-label="船の状態"></section>
+
+    <main class="main">
+      <section class="panel shipwrap">
+        <div class="toolbar" id="toolbar"></div>
+        <div class="gridframe">
+          <div class="heading" aria-hidden="true"><span>船尾</span><span class="arrow">進行方向 ▶</span></div>
+          <div class="grid" id="grid" role="grid" aria-label="船内グリッド"></div>
+          <div class="hoverline" id="hoverline">&nbsp;</div>
+        </div>
+        <div class="controls" id="controls"></div>
+      </section>
+
+      <aside class="panel side">
+        <div class="tabs" role="tablist">
+          <button type="button" class="tab" data-tab="build" role="tab">建造</button>
+          <button type="button" class="tab" data-tab="research" role="tab">研究</button>
+          <button type="button" class="tab" data-tab="info" role="tab">詳細</button>
+        </div>
+        <div class="tabbody" id="tabbody"></div>
+      </aside>
+    </main>
+
+    <section class="panel logpanel">
+      <h2 class="ptitle">航海日誌</h2>
+      <ol class="log" id="log"></ol>
+    </section>
+
+    <footer class="foot">
+      グリッドにモジュールを配置して世代船を運営するターン制シミュレーション。セーブはこのブラウザに自動保存されます。
+    </footer>
+  </div>
+
+  <div class="modal-back" id="modal" hidden>
+    <div class="modal" role="dialog" aria-modal="true" id="modalbox"></div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="js/data.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/ui.js"></script>
+</body>
+</html>
