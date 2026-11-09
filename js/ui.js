@@ -38,6 +38,8 @@
     }
     return e;
   }
+  // モジュールのアイコン（icons.js が読めなかったときは従来の1文字表示）
+  const iconOf = id => (window.ArkIcons ? window.ArkIcons.icon(id) : D.MODULES[id].glyph);
   const fmt = (n, d = 0) => (Math.round(n * 10 ** d) / 10 ** d).toLocaleString('ja-JP', { minimumFractionDigits: d, maximumFractionDigits: d });
   const signed = (n, d = 1) => (n > 0.05 ? '+' : n < -0.05 ? '−' : '±') + fmt(Math.abs(n), d);
 
@@ -234,7 +236,7 @@
         if (m.status === 'active' && !m.powered) classes.push('nopower');
         if (m.def.kind === 'engine' && m.out > 0) classes.push('thrusting');
         title = cellLabel(m);
-        kids.push(el('span', { class: 'glyph', style: 'color:' + m.def.color }, m.def.glyph));
+        kids.push(el('span', { class: 'glyph', style: 'color:' + m.def.color }, iconOf(m.id)));
         kids.push(el('span', { class: 'mname' }, m.def.name));
         const cond = Math.max(0, Math.min(100, m.cell.cond));
         const condCls = cond < 30 ? 'low' : cond < 60 ? 'mid' : 'ok';
@@ -366,7 +368,7 @@
         onclick: () => { setTool('build', id); },
         title: def.desc
       },
-        el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, def.glyph),
+        el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, iconOf(id)),
         el('span', { class: 'cbody' },
           el('span', { class: 'cname' }, def.name, pl ? el('small', { class: 'tag' }, pl) : null),
           el('span', { class: 'cmeta' }, meta.join('・')),
@@ -460,7 +462,7 @@
         quick.appendChild(el('button', {
           type: 'button', class: 'qb', disabled: chk.ok ? null : true, title: def.desc + (chk.ok ? '' : '（' + chk.reason + '）'),
           onclick: () => act(() => G.build(S, r, c, id))
-        }, el('span', { class: 'qg', style: 'color:' + def.color }, def.glyph), el('span', { class: 'qn' }, def.name), el('span', { class: 'qc' }, def.cost)));
+        }, el('span', { class: 'qg', style: 'color:' + def.color }, iconOf(id)), el('span', { class: 'qn' }, def.name), el('span', { class: 'qc' }, def.cost)));
       }
       body.appendChild(el('p', { class: 'small' }, 'ここに直接建造（数字は資材）：'));
       body.appendChild(quick);
@@ -468,7 +470,7 @@
       return;
     }
     const def = m.def;
-    body.appendChild(el('h3', { class: 'itit' }, el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, def.glyph), ' ', def.name, ' ', el('small', null, pos)));
+    body.appendChild(el('h3', { class: 'itit' }, el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, iconOf(m.id)), ' ', def.name, ' ', el('small', null, pos)));
     const stText = { active: m.powered ? (m.eff < 0.99 && !def.powerGen ? '稼働中（効率' + Math.round(m.eff * 100) + '%）' : '稼働中') : '電力不足で停止', building: '建造中（残り' + m.cell.build + 'ターン）', broken: '故障中', off: '手動で停止中', blocked: '配置条件を満たしていない' }[m.status];
     const rows = [
       ['状態', stText],
