@@ -6,6 +6,6 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node --test tests/*.test.js",
-    "balance": "node tools/bot.js 100 smart && node tools/bot.js 10 idle"
+    "balance": "node tools/bot.js 40 smart easy && node tools/bot.js 40 smart normal && node tools/bot.js 40 smart hard && node tools/bot.js 10 idle easy"
   }
 }

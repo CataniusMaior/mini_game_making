@@ -28,6 +28,7 @@
     <main class="main">
       <section class="panel shipwrap">
         <div class="toolbar" id="toolbar"></div>
+        <div class="overlaybar" id="overlaybar" role="radiogroup" aria-label="範囲の重ね表示"></div>
         <div class="gridframe">
           <div class="heading" aria-hidden="true"><span>船尾</span><span class="arrow">進行方向 ▶</span></div>
           <div class="grid" id="grid" role="grid" aria-label="船内グリッド"></div>
@@ -48,11 +49,13 @@
 
     <section class="panel logpanel">
       <h2 class="ptitle">航海日誌</h2>
+      <div class="summary" id="summary" hidden></div>
       <ol class="log" id="log"></ol>
     </section>
 
     <footer class="foot">
-      グリッドにモジュールを配置して世代船を運営するターン制シミュレーション。セーブはこのブラウザに自動保存されます。
+      グリッドにモジュールを配置して世代船を運営するターン制シミュレーション。セーブはこのブラウザに自動保存されます。<br>
+      Enter：ターン終了　Ctrl+Z：このターンの操作をやり直す　Esc：ツール解除
     </footer>
   </div>
 

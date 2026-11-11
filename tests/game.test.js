@@ -4,145 +4,209 @@ const assert = require('node:assert/strict');
 const G = require('../js/game.js');
 const Bot = require('../tools/bot.js');
 const D = G.D;
+const R = D.RULES;
 
 const at = (s, r, c) => s.cells[G.idx(s, r, c)];
-const find = (s, id) => {
-  for (let i = 0; i < s.cells.length; i++) if (s.cells[i] && s.cells[i].id === id) return G.rc(s, i);
-  return null;
-};
+const done = id => ({ id, age: 0, broken: false, build: 0, overhaul: 0, enabled: true });
+const put = (s, r, c, id) => { s.cells[G.idx(s, r, c)] = done(id); };
+const blockAt = (F, s, r, c) => F.blocks.find(b => b.i === G.idx(s, r, c));
+// 範囲供給の計算だけを見たいテスト用に、艦橋も含めて何もない船を作る
+function emptyShip(seed) {
+  const s = G.newGame(seed || 1);
+  s.cells = s.cells.map(() => null);
+  s.researched = {};
+  return s;
+}
 
-test('初期状態：電力・酸素・収容力・作業回数が整っている', () => {
-  const s = G.newGame(1);
-  const F = G.computeFlows(s);
-  assert.equal(s.status, 'playing');
-  assert.ok(F.powerGen >= F.powerDemand, '初期配置で電力が足りている');
-  assert.equal(F.cap, 150, '居住区5つ×30人');
-  for (const m of F.mods) {
-    assert.equal(m.status, 'active', m.def.name + ' が稼働している');
-    if (m.def.kind === 'hab') assert.ok(F.o2[m.i] > 0, '居住区に酸素が届いている');
+test('初期状態：施設はすべて稼働し、人口は住める人数に収まっている', () => {
+  for (const diff of ['easy', 'normal', 'hard']) {
+    const s = G.newGame(1, diff);
+    const F = G.computeFlows(s);
+    assert.equal(s.status, 'playing');
+    for (const m of F.mods) assert.equal(m.eff, 1, diff + ': ' + m.def.name + ' が100%で稼働');
+    assert.ok(s.pop > 0 && s.pop <= F.support, diff + ': 人口 ' + s.pop + ' ≦ 住める人数 ' + F.support);
+    assert.equal(F.overflow, 0);
+    assert.equal(s.ap, R.baseAp);
+    assert.ok(F.speed > F.waveSpeed, '初期は衝撃波より速い');
+    assert.ok(s.wave < 0, '衝撃波は後方から始まる');
+    assert.equal(Object.keys(s.researched).length, 1, '技術が1つ受け継がれている');
   }
-  assert.equal(s.ap, D.RULES.baseAp);
-  assert.ok(F.speed > 0);
-  assert.ok(F.foodProd > F.foodCons, '初期は食料が黒字');
-  assert.equal(s.route[s.route.length - 1].type, 'goal');
-  const total = s.route.reduce((a, r) => a + r.len, 0);
-  assert.equal(total, D.RULES.totalDistance, '航路の合計距離が目的地までの距離と一致');
 });
 
-test('配置ルール：推進器は船尾、集光パネルは外縁にしか置けない', () => {
-  const s = G.newGame(2);
-  s.mat = 999;
-  // (2,4) は内部マス
-  assert.equal(at(s, 2, 4), null);
-  assert.equal(G.canBuild(s, 2, 4, 'engine').ok, false);
-  assert.equal(G.canBuild(s, 2, 4, 'solar').ok, false);
-  assert.equal(G.canBuild(s, 2, 4, 'hab').ok, true);
-  // (5,1) は船尾かつ外縁
-  assert.equal(G.canBuild(s, 5, 1, 'engine').ok, true);
-  assert.equal(G.canBuild(s, 5, 1, 'solar').ok, true);
-  // 研究前のモジュールは建造できない
-  assert.match(G.canBuild(s, 2, 4, 'medbay').reason, /研究/);
-  // 船外には建造できない
-  assert.equal(G.canBuild(s, 0, 0, 'hab').ok, false);
+test('航路：区間が目的地までをすき間なく覆い、寄港地は区間の境目にある', () => {
+  const s = G.newGame(7);
+  const { legs, ports } = s.route;
+  assert.equal(legs[0].start, 0);
+  for (let k = 1; k < legs.length; k++) assert.equal(legs[k].start, legs[k - 1].start + legs[k - 1].len);
+  const last = legs[legs.length - 1];
+  assert.equal(last.start + last.len, R.totalDistance);
+  assert.equal(ports.length, legs.length - 1);
+  ports.forEach((p, k) => assert.equal(p.pos, legs[k + 1].start));
+  assert.ok(ports.length >= 6);
 });
 
-test('建造は作業回数と資材を消費し、指定ターン後に完成する', () => {
+test('範囲供給：隣は100%、2マス先は50%、範囲外は0', () => {
+  const s = emptyShip();
+  put(s, 1, 1, 'life');    // 空気10・範囲2
+  put(s, 2, 1, 'reactor'); // 生命維持装置に電力を届ける
+  const F = G.computeFlows(s);
+  const air = (r, c) => F.fields.air[G.idx(s, r, c)];
+  assert.equal(air(1, 2), 10);
+  assert.equal(air(2, 2), 10);
+  assert.equal(air(1, 3), 5);
+  assert.equal(air(3, 3), 5);
+  assert.equal(air(1, 4), 0);
+  // 電力がなければ止まり、空気も届かない
+  s.cells[G.idx(s, 2, 1)] = null;
+  assert.equal(G.computeFlows(s).fields.air[G.idx(s, 1, 2)], 0);
+});
+
+test('居住ブロックの住める人数は、空気と食料の少ないほうで決まる', () => {
+  const s = emptyShip();
+  put(s, 1, 1, 'life');
+  put(s, 1, 3, 'farm');
+  put(s, 2, 2, 'reactor');
+  s.pop = 0;
+  const F = G.computeFlows(s);
+  const b = blockAt(F, s, 1, 2); // 空気10（25人分）・食料8（16人分）
+  assert.equal(b.air, 10);
+  assert.equal(b.food, 8);
+  assert.equal(b.support, 16);
+  const far = blockAt(F, s, 1, 5); // 食料4（8人分）・空気0
+  assert.equal(far.support, 0);
+});
+
+test('電力：必要量以上で100%、半分以上で50%、それ未満は停止', () => {
+  const s = emptyShip();
+  put(s, 1, 1, 'solar'); // 電力10・範囲1
+  put(s, 1, 2, 'lab');   // 必要15 → 10は半分以上
+  put(s, 2, 1, 'shop');  // 必要8 → 10で100%
+  put(s, 1, 4, 'lounge'); // 電力が届かない
+  const F = G.computeFlows(s);
+  assert.equal(F.info[G.idx(s, 1, 2)].eff, 0.5);
+  assert.equal(F.info[G.idx(s, 2, 1)].eff, 1);
+  assert.equal(F.info[G.idx(s, 1, 4)].eff, 0);
+});
+
+test('配電ノード：範囲内では電力が弱まらず、1マス遠くまで届く', () => {
+  const s = emptyShip();
+  put(s, 1, 1, 'reactor'); // 電力30・範囲2
+  const p0 = G.computeFlows(s).fields.power;
+  assert.equal(p0[G.idx(s, 1, 3)], 15);
+  assert.equal(p0[G.idx(s, 1, 4)], 0);
+  put(s, 2, 4, 'relay');
+  const p1 = G.computeFlows(s).fields.power;
+  assert.equal(p1[G.idx(s, 1, 3)], 30, '2マス先でも100%');
+  assert.equal(p1[G.idx(s, 1, 4)], 30 * D.RELAY_FALLOFF[3], '3マス先にも届く');
+});
+
+test('建造：居住ブロックがなくなり、プレビューと実際の変化が一致する', () => {
   const s = G.newGame(3);
-  const mat0 = s.mat;
-  assert.ok(G.build(s, 2, 4, 'hab').ok);
-  assert.equal(s.mat, mat0 - D.MODULES.hab.cost);
-  assert.equal(s.ap, D.RULES.baseAp - 1);
-  assert.equal(at(s, 2, 4).build, D.MODULES.hab.build);
-  assert.equal(G.computeFlows(s).info[G.idx(s, 2, 4)].status, 'building');
-  for (let k = 0; k < D.MODULES.hab.build; k++) { if (s.pendingEvent) G.resolveEvent(s, 2 % s.pendingEvent.choices.length); G.endTurn(s); }
-  assert.equal(at(s, 2, 4).build, 0);
-  // 作業回数が尽きると建造できない
-  s.ap = 0;
-  assert.match(G.canBuild(s, 4, 4, 'hab').reason, /作業回数/);
+  const F0 = G.computeFlows(s);
+  const target = F0.blocks.find(b => b.support > 0 && G.canBuild(s, b.r, b.c, 'lounge').ok);
+  const p = G.previewBuild(s, target.r, target.c, 'lounge');
+  assert.ok(p.ok);
+  assert.ok(p.support <= -target.support + 1e-9 || p.support < 0, '住める人数が減る');
+  assert.ok(G.build(s, target.r, target.c, 'lounge').ok);
+  assert.equal(at(s, target.r, target.c).build, D.MODULES.lounge.build);
+  assert.equal(s.ap, R.baseAp - 1);
+  // 建造中のマスは居住ブロックではない
+  assert.equal(blockAt(G.computeFlows(s), s, target.r, target.c), undefined);
 });
 
-test('外殻拡張：推進器の噴射口を塞ぐ拡張はできない', () => {
+test('配置ルール：推進器は船尾、集光パネルは外縁。噴射口を塞ぐ拡張はできない', () => {
   const s = G.newGame(4);
   s.mat = 999;
-  // (2,1) に推進器があるので (2,0) は拡張不可
+  assert.equal(G.canBuild(s, 2, 4, 'engine').ok, false);
+  assert.equal(G.canBuild(s, 2, 4, 'solar').ok, false);
+  assert.equal(G.canBuild(s, 3, 1, 'engine').ok, true);  // 船尾の空きブロック
   assert.equal(at(s, 2, 1).id, 'engine');
   assert.match(G.canExpand(s, 2, 0).reason, /噴射口/);
-  // (5,0) は拡張できる
-  assert.equal(G.canExpand(s, 5, 0).ok, true);
-  assert.ok(G.expand(s, 5, 0).ok);
-  assert.equal(s.hull[G.idx(s, 5, 0)], true);
-  // 船体に隣接していないマスは拡張不可
-  assert.match(G.canExpand(s, 0, 6).reason, /隣接/);
-  // 船体工学でコスト半減
-  assert.equal(G.expandCost(s), D.RULES.expandCost);
-  s.researched.hulltech = true;
-  assert.equal(G.expandCost(s), D.RULES.expandCost / 2);
+  assert.equal(G.canExpand(s, 3, 0).ok, true);
+  assert.match(G.canBuild(s, 2, 4, 'fusion').reason, /研究/);
+  assert.equal(G.canDemolish(s, 3, 3).ok, false, '艦橋は撤去できない');
 });
 
-test('電力不足では優先度の低い区画から止まり、生命維持装置は動き続ける', () => {
+test('推力増幅器：隣の推進器の推力+50%、燃料も増える', () => {
   const s = G.newGame(5);
-  const [rr, rc] = find(s, 'reactor');
-  s.cells[G.idx(s, rr, rc)] = null; // 炉を失う
-  let F = G.computeFlows(s);
-  assert.ok(F.powerDemand > F.powerGen);
-  assert.ok(F.mods.some(m => m.id === 'engine' && !m.powered), '推進器の一部が止まる');
-  // さらに集光パネルも1つ失うと研究ラボまで止まる
-  const [sr, sc] = find(s, 'solar');
-  s.cells[G.idx(s, sr, sc)] = null;
-  F = G.computeFlows(s);
-  const lab = F.mods.find(m => m.id === 'lab');
-  assert.equal(lab.powered, false, '研究ラボは止まる');
-  for (const m of F.mods.filter(m => m.id === 'life')) assert.equal(m.powered, true, '生命維持は最優先');
-  for (const m of F.mods.filter(m => m.id === 'farm')) assert.equal(m.powered, true, '農場は研究より優先');
+  const F0 = G.computeFlows(s);
+  put(s, 3, 1, 'booster'); // 推進器(2,1)と(4,1)の間
+  const F1 = G.computeFlows(s);
+  assert.ok(Math.abs(F1.thrust - F0.thrust * 1.5) < 1e-9, '推力1.5倍');
+  assert.ok(Math.abs(F1.fuelUse - (F0.fuelUse + 2 * 1.5)) < 1e-9, '増幅する推進器2基ぶんの燃料');
 });
 
-test('人手は優先度順に割り当てられ、農場が研究ラボより先に埋まる', () => {
+test('老朽化：寿命の6割を過ぎると壊れやすくなり、修理では戻らず、改修で新品に戻る', () => {
   const s = G.newGame(6);
-  // 必要人手 81 に対して人口を 60 に減らす
-  s.pop = 60;
-  const F = G.computeFlows(s);
-  const farm = F.mods.find(m => m.id === 'farm');
-  const lab = F.mods.find(m => m.id === 'lab');
-  const life = F.mods.find(m => m.id === 'life');
-  assert.equal(life.staff, 1);
-  assert.equal(farm.staff, 1);
-  assert.ok(lab.staff < 1, '研究ラボは人手不足');
+  s.mat = 999;
+  const cell = at(s, 2, 3); // 生命維持装置
+  const L = G.lifespan(s, 'life');
+  cell.age = L * 0.3;
+  const young = G.breakChance(s, cell);
+  cell.age = L * 0.9;
+  const old = G.breakChance(s, cell);
+  assert.ok(young < 0.01 && old > 0.15, '若いと壊れにくく、古いと壊れやすい');
+  cell.broken = true;
+  assert.ok(G.repair(s, 2, 3).ok);
+  assert.equal(cell.broken, false);
+  assert.equal(cell.age, L * 0.9, '修理しても老朽化はそのまま');
+  assert.ok(G.overhaul(s, 2, 3).ok);
+  assert.equal(G.computeFlows(s).info[G.idx(s, 2, 3)].status, 'overhaul', '改修中は止まる');
+  for (let k = 0; k < G.overhaulTurns(s); k++) { if (s.pendingEvent) G.resolveEvent(s, s.pendingEvent.choices.length - 1); G.endTurn(s); }
+  assert.equal(cell.overhaul, 0);
+  assert.ok(cell.age <= 1, '改修後は新品同様');
 });
 
-test('燃料は炉に優先して回る', () => {
-  const s = G.newGame(7);
-  s.fuel = 0.5; // 炉の必要量（0.5）ちょうど
-  const F = G.computeFlows(s);
-  assert.equal(F.reactorFuelRatio, 1);
-  assert.equal(F.engineFuelRatio, 0);
-  assert.equal(F.thrust, 0);
-  assert.ok(F.speed > 0, '推力がなくても慣性で少し進む');
-});
-
-test('停泊モードでは進まず、ドローンの採取が2倍になる', () => {
+test('寄港：寄港地で止まり、降下艇が資源を採り、出発すると訪問済みになる', () => {
   const s = G.newGame(8);
-  assert.ok(G.build(s, 1, 3, 'drone').ok);
-  s.cells[G.idx(s, 1, 3)].build = 0;
-  const cruise = G.computeFlows(s);
-  G.setMode(s, 'hold');
-  const hold = G.computeFlows(s);
-  assert.equal(hold.speed, 0);
-  assert.ok(Math.abs(hold.matProd - cruise.matProd * 2) < 1e-9);
-});
-
-test('隣接ボーナス：農場は生命維持装置の隣で増産、推進器は炉の隣で推力増', () => {
-  const s = G.newGame(9);
+  const port = s.route.ports[0];
+  s.dist = port.pos - 1;
+  G.endTurn(s);
+  if (s.pendingEvent) G.resolveEvent(s, s.pendingEvent.choices.length - 1);
+  assert.equal(s.portIndex, 0);
+  assert.equal(s.mode, 'orbit');
+  assert.equal(s.dist, port.pos, '寄港地で止まる');
   const F = G.computeFlows(s);
-  const farm = F.mods.find(m => m.id === 'farm');
-  assert.equal(farm.out, D.MODULES.farm.food + 2);
-  const eng = F.mods.find(m => m.id === 'engine');
-  assert.ok(Math.abs(eng.out - D.MODULES.engine.thrust * 1.2) < 1e-9);
+  assert.equal(F.speed, 0);
+  assert.ok(F.harvest.mat > 0 || F.harvest.fuel > 0, '降下艇が採取する');
+  const before = port.mat + port.fuel;
+  G.endTurn(s);
+  if (s.pendingEvent) G.resolveEvent(s, s.pendingEvent.choices.length - 1);
+  assert.ok(port.mat + port.fuel < before, '埋蔵量が減る');
+  if (s.portIndex === 0) assert.ok(G.setMode(s, 'cruise').ok);
+  assert.equal(port.visited, true);
+  assert.equal(s.portIndex, -1);
+  assert.equal(G.setMode(s, 'orbit').ok, false, '寄港地以外では停泊できない');
 });
 
-test('同じシードと操作なら結果が一致する（決定的）', () => {
+test('寄港地に寄らない設定にすると通過する', () => {
+  const s = G.newGame(9);
+  const port = s.route.ports[0];
+  assert.ok(G.setSkipNext(s, true).ok);
+  s.dist = port.pos - 1;
+  G.endTurn(s);
+  assert.equal(s.portIndex, -1);
+  assert.ok(s.dist > port.pos);
+  assert.equal(port.visited, true);
+});
+
+test('衝撃波：追いつかれると施設が壊れ、人が失われる', () => {
+  const s = G.newGame(10);
+  s.wave = s.dist - 1;
+  const pop0 = s.pop;
+  G.setMode(s, 'cruise');
+  // 動けないようにする
+  for (const c of s.cells) if (c && D.MODULES[c.id].kind === 'engine') c.enabled = false;
+  G.endTurn(s);
+  assert.ok(s.wave >= s.dist);
+  assert.ok(s.pop < pop0, '人が失われる');
+  assert.ok(s.log.some(l => /衝撃波に呑まれた/.test(l.text)));
+});
+
+test('同じシード・同じ操作なら結果が一致する（決定的）', () => {
   const run = () => {
-    const s = G.newGame(1234);
-    for (let t = 0; t < 30; t++) {
+    const s = G.newGame(1234, 'normal');
+    for (let t = 0; t < 40; t++) {
       if (s.pendingEvent) G.resolveEvent(s, 0);
       Bot.smartTurn(s);
       G.endTurn(s);
@@ -153,36 +217,43 @@ test('同じシードと操作なら結果が一致する（決定的）', () =>
 });
 
 test('セーブとロード：途中から再開しても同じ結果になる', () => {
-  const a = G.newGame(99);
+  const a = G.newGame(99, 'hard');
   for (let t = 0; t < 10; t++) { if (a.pendingEvent) G.resolveEvent(a, 0); Bot.smartTurn(a); G.endTurn(a); }
   const b = G.deserialize(G.serialize(a));
-  for (let t = 0; t < 15; t++) {
+  for (let t = 0; t < 20; t++) {
     for (const s of [a, b]) { if (s.pendingEvent) G.resolveEvent(s, 0); Bot.smartTurn(s); G.endTurn(s); }
   }
   assert.equal(G.serialize(a), G.serialize(b));
-  assert.throws(() => G.deserialize('{"version":999}'));
+  assert.throws(() => G.deserialize('{"version":1}'));
 });
 
 test('選択イベント中はターンを進められず、選ぶと解除される', () => {
   let s = null;
   for (let seed = 1; seed < 400 && !s; seed++) {
     const t = G.newGame(seed);
-    for (let k = 0; k < 40; k++) { Bot.smartTurn(t); G.endTurn(t); if (t.pendingEvent) { s = t; break; } }
+    for (let k = 0; k < 40; k++) { Bot.smartTurn(t); G.endTurn(t); if (t.pendingEvent) { s = t; break; } if (t.status !== 'playing') break; }
   }
   assert.ok(s, '選択イベントが発生するシードがある');
   const turn = s.turn;
   assert.equal(G.endTurn(s).ok, false);
-  assert.equal(G.canBuild(s, 2, 4, 'hab').ok, false);
-  assert.ok(G.resolveEvent(s, 0).ok);
+  assert.equal(G.canResearch(s, 'scanner').ok, false);
+  assert.ok(G.resolveEvent(s, s.pendingEvent.choices.length - 1).ok);
   assert.equal(s.pendingEvent, null);
-  assert.equal(G.endTurn(s).ok, true);
-  assert.equal(s.turn, turn + 1);
+  if (s.status === 'playing') {
+    assert.equal(G.endTurn(s).ok, true);
+    assert.equal(s.turn, turn + 1);
+  }
 });
 
-test('バランス：簡易ボットは大半の航海で到着し、何もしなければ到着できない', () => {
-  let won = 0;
-  const N = 20;
-  for (let k = 0; k < N; k++) if (Bot.play(500 + k * 101, 'smart').status === 'won') won++;
-  assert.ok(won >= N * 0.7, '簡易ボットの到着率 ' + won + '/' + N);
-  for (let k = 0; k < 5; k++) assert.notEqual(Bot.play(900 + k, 'idle').status, 'won');
+test('バランス：難易度が上がるほど到着しにくく、何もしなければ到着できない', () => {
+  const rate = diff => {
+    let won = 0;
+    for (let k = 0; k < 16; k++) if (Bot.play(500 + k * 101, 'smart', diff).status === 'won') won++;
+    return won;
+  };
+  const easy = rate('easy'), normal = rate('normal'), hard = rate('hard');
+  assert.ok(easy >= 9, 'やさしい：簡易ボットの到着 ' + easy + '/16');
+  assert.ok(normal >= 3 && normal <= easy, 'ふつう：簡易ボットの到着 ' + normal + '/16');
+  assert.ok(hard <= normal, 'むずかしい：簡易ボットの到着 ' + hard + '/16');
+  for (let k = 0; k < 4; k++) assert.notEqual(Bot.play(900 + k, 'idle', 'easy').status, 'won');
 });

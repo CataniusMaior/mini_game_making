@@ -5,16 +5,19 @@
   'use strict';
   const G = window.ArkGame;
   const D = G.D;
-  const SAVE_KEY = 'driftark.save.v1';
-  const BEST_KEY = 'driftark.best.v1';
+  const SAVE_KEY = 'driftark.save.v2';
+  const BEST_KEY = 'driftark.best.v2';
 
   let S = null;                             // ゲーム状態
   let tool = { type: 'inspect', id: null }; // 現在のツール
   let selected = null;                      // 選択中のマス
-  let overlay = 'none';                     // 'none' | 'o2' | 'shield'
+  let overlay = 'none';                     // 重ね表示するフィールド
   let tab = 'build';
+  let hoverIdx = null;
   let lastTurnSeen = 0;
   let modalKind = null;
+  let undoSnap = null;                      // このターンの開始時点（やり直し用）
+  let cellEls = [];
 
   /* ---------- 小道具 ---------- */
   const $ = id => document.getElementById(id);
@@ -25,10 +28,8 @@
         const v = attrs[k];
         if (v === null || v === undefined || v === false) continue;
         if (k === 'class') e.className = v;
-        else if (k === 'text') e.textContent = v;
         else if (k === 'style') e.setAttribute('style', v);
         else if (k.startsWith('on')) e.addEventListener(k.slice(2), v);
-        else if (k === 'dataset') Object.assign(e.dataset, v);
         else e.setAttribute(k, v === true ? '' : v);
       }
     }
@@ -38,8 +39,7 @@
     }
     return e;
   }
-  // モジュールのアイコン（icons.js が読めなかったときは従来の1文字表示）
-  const iconOf = id => (window.ArkIcons ? window.ArkIcons.icon(id) : D.MODULES[id].glyph);
+  const iconOf = id => (window.ArkIcons ? window.ArkIcons.icon(id) : document.createTextNode('■'));
   const fmt = (n, d = 0) => (Math.round(n * 10 ** d) / 10 ** d).toLocaleString('ja-JP', { minimumFractionDigits: d, maximumFractionDigits: d });
   const signed = (n, d = 1) => (n > 0.05 ? '+' : n < -0.05 ? '−' : '±') + fmt(Math.abs(n), d);
 
@@ -53,12 +53,20 @@
     t.textContent = text;
     t.className = 'toast show ' + (kind || '');
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { t.className = 'toast'; }, 2600);
+    toastTimer = setTimeout(() => { t.className = 'toast'; }, 2800);
   }
 
-  function save() {
-    if (!S) return;
-    storageSet(SAVE_KEY, G.serialize(S));
+  function save() { if (S) storageSet(SAVE_KEY, G.serialize(S)); }
+  function snapshot() { undoSnap = S ? G.serialize(S) : null; }
+  const canUndo = () => !!(S && undoSnap && S.status === 'playing' && undoSnap !== G.serialize(S));
+  function undo() {
+    if (!canUndo()) return;
+    S = G.deserialize(undoSnap);
+    selected = null;
+    tool = { type: 'inspect', id: null };
+    save();
+    render();
+    toast('このターンの操作を取り消しました');
   }
 
   /* ---------- 操作の共通処理 ---------- */
@@ -80,53 +88,111 @@
     render();
   }
 
+  /* ---------- 文言 ---------- */
+  function emitText(def, short) {
+    if (!def.emit) return '';
+    return Object.keys(def.emit).map(f => {
+      const [v, r] = def.emit[f];
+      return D.FIELDS[f].name + (v < 0 ? '−' + (-v) : '+' + v) + D.FIELDS[f].unit + (short ? '/' + r : '（範囲' + r + '）');
+    }).join(short ? '・' : '、');
+  }
+
+  function statusText(m) {
+    switch (m.status) {
+      case 'building': return '建造中（あと' + m.cell.build + 'ターン）';
+      case 'overhaul': return '改修中（あと' + m.cell.overhaul + 'ターン）';
+      case 'broken': return '故障中';
+      case 'off': return '手動で停止中';
+      case 'blocked': return '配置条件を満たしていない';
+      default:
+        if (m.eff >= 1) return '稼働中';
+        if (m.eff > 0) return '出力50%（電力不足）';
+        return m.def.kind === 'reactor' ? '燃料切れで停止' : '停止（電力不足）';
+    }
+  }
+
+  function outputText(m, F) {
+    if (m.status !== 'active') return statusText(m);
+    const k = m.def.kind;
+    if (m.def.emit && m.def.emit.power) return '電力 +' + fmt(m.gen, 1) + '（範囲' + m.def.emit.power[1] + '）';
+    if (m.eff <= 0) return statusText(m);
+    switch (k) {
+      case 'engine': return S.mode === 'orbit' ? '待機中（停泊）' : '推力 ' + fmt(m.out, 1) + (m.boosters ? '（増幅×' + fmt(1 + 0.5 * m.boosters, 1) + '）' : '');
+      case 'booster': return m.boosting ? '隣の推進器' + m.boosting + '基を増幅中' : '隣に推進器がない';
+      case 'storage': return '資材・燃料の上限+' + m.def.store.mat;
+      case 'shop': return m.eff >= 0.5 ? '作業回数+1' : '機能していない';
+      case 'lander':
+        if (G.currentPort(S)) return '採取中：資材' + fmt(m.def.harvest.mat * m.eff) + '・燃料' + fmt(m.def.harvest.fuel * m.eff) + '/ターンまで';
+        return m.out > 0 ? '航行中の採掘 資材+' + fmt(m.out, 1) : '待機中（寄港地で採取）';
+      case 'refinery': return '資材' + fmt(m.def.refine.in * m.eff, 1) + ' → 燃料' + fmt(m.def.refine.out * m.eff, 1) + (F.scoopOut > 0 ? '・ガス回収' : '');
+      case 'shield': return '周囲1マスを防護中';
+      case 'relay': return '周囲1マスの電力が弱まらない';
+      default: return emitText(m.def) + (m.eff < 1 ? '（50%）' : '');
+    }
+  }
+
   /* ---------- 描画 ---------- */
   function render() {
     if (!S) return;
     const F = G.computeFlows(S);
     $('turn').textContent = S.turn;
-    renderRoute();
+    renderRoute(F);
     renderStats(F);
     renderToolbar();
+    renderOverlayBar();
     renderGrid(F);
     renderControls(F);
     renderSide(F);
+    renderSummary();
     renderLog();
     syncModal();
   }
 
-  function renderRoute() {
+  function renderRoute(F) {
     const box = $('route');
     box.textContent = '';
     const total = D.RULES.totalDistance;
+    const pct = v => Math.max(0, Math.min(100, (v / total) * 100));
     const bar = el('div', { class: 'routebar' });
+    const legNow = G.legIndexAt(S, S.dist);
     const range = G.scanRange(S);
-    S.route.forEach((seg, k) => {
-      const known = k <= S.sectorIndex + range || seg.type === 'goal';
-      const def = D.SECTORS[seg.type];
-      const w = (seg.len / total) * 100;
-      const cls = 'seg' + (k === S.sectorIndex ? ' cur' : '') + (k < S.sectorIndex ? ' past' : '') + (known ? '' : ' unknown');
+    S.route.legs.forEach((leg, k) => {
+      const known = k <= legNow + range;
+      const def = D.LEGS[leg.type];
       bar.appendChild(el('div', {
-        class: cls,
-        style: 'width:' + w + '%;' + (known ? 'background:' + def.color : ''),
-        title: known ? def.name + '（' + seg.len + '光年）— ' + def.desc : '未観測の宙域（長距離スキャナで先まで観測できる）'
-      }, el('span', { text: known ? def.short : '？' })));
+        class: 'seg' + (k === legNow && S.portIndex < 0 ? ' cur' : '') + (k < legNow ? ' past' : '') + (known ? '' : ' unknown'),
+        style: 'left:' + pct(leg.start) + '%;width:' + pct(leg.len) + '%;' + (known ? 'background:' + def.color : ''),
+        title: known ? def.name + '（' + leg.len + '光年）— ' + def.desc : '未観測の区間（長距離スキャナで先まで観測できる）'
+      }, el('span', null, known ? def.short : '？')));
     });
-    const pos = Math.min(100, (S.dist / total) * 100);
-    bar.appendChild(el('div', { class: 'shipmark', style: 'left:' + pos + '%', title: '現在位置' }, '▶'));
+    S.route.ports.forEach((p, k) => {
+      const known = G.legIndexAt(S, p.pos) <= legNow + range;
+      const pd = D.PORTS[p.type];
+      bar.appendChild(el('div', {
+        class: 'port' + (p.visited ? ' visited' : '') + (k === S.portIndex ? ' here' : '') + (p.skip ? ' skip' : ''),
+        style: 'left:' + pct(p.pos) + '%;' + (known ? 'background:' + pd.color : ''),
+        title: known ? p.name + '（' + pd.name + '）' + (p.visited ? '・訪問済み' : '') + (p.skip ? '・寄らない' : '') : '未観測の寄港地'
+      }));
+    });
+    bar.appendChild(el('div', { class: 'goal', style: 'left:100%', title: '目的地 惑星ヴェルダ' }));
+    if (S.wave > 0) bar.appendChild(el('div', { class: 'wave', style: 'width:' + pct(S.wave) + '%', title: '恒星の衝撃波' }));
+    bar.appendChild(el('div', { class: 'shipmark', style: 'left:' + pct(S.dist) + '%', title: '現在位置' }, '▶'));
 
-    const sec = G.currentSector(S);
-    const sd = D.SECTORS[sec.type];
-    const remainSec = Math.max(0, sec.start + sec.len - S.dist);
-    const next = S.route[S.sectorIndex + 1];
-    const nextKnown = next && (1 <= range || next.type === 'goal');
+    const port = G.currentPort(S);
+    const leg = G.currentLeg(S);
+    const nk = G.nextPortIndex(S);
+    const next = nk >= 0 ? S.route.ports[nk] : null;
+    const nextKnown = next && G.legIndexAt(S, next.pos) <= legNow + range;
+    const gapCls = F.gap <= 0 ? 'bad' : (F.waveEta !== null && F.waveEta <= 4 ? 'bad' : F.waveEta !== null && F.waveEta <= 10 ? 'warn' : 'ok');
+    const where = port
+      ? el('span', { class: 'secname', style: 'border-color:' + D.PORTS[port.type].color }, port.name + '（' + D.PORTS[port.type].name + '）に停泊中')
+      : el('span', { class: 'secname', style: 'border-color:' + D.LEGS[leg.type].color }, D.LEGS[leg.type].name);
     const info = el('div', { class: 'routeinfo' },
-      el('span', { class: 'secname', style: 'border-color:' + sd.color }, sd.name),
-      el('span', { class: 'muted' }, sd.desc),
+      where,
+      el('span', { class: 'muted' }, port ? D.PORTS[port.type].desc : D.LEGS[leg.type].desc),
       el('span', { class: 'spacer' }),
-      el('span', null, 'この宙域の残り ', el('b', null, fmt(remainSec)), ' 光年'),
-      next ? el('span', null, '次：', el('b', null, nextKnown ? D.SECTORS[next.type].name : '未観測')) : null,
-      el('span', null, '目的地まで ', el('b', null, fmt(Math.max(0, total - S.dist))), ' 光年')
+      next ? el('span', null, '次の寄港地：', el('b', null, nextKnown ? next.name + '（' + D.PORTS[next.type].name + '）' : '未観測'), ' まで ', el('b', null, fmt(next.pos - S.dist)), ' 光年') : el('span', null, '目的地まで ', el('b', null, fmt(total - S.dist)), ' 光年'),
+      el('span', { class: 'wavegap ' + gapCls }, F.gap <= 0 ? '衝撃波の中！' : '衝撃波まで ' + fmt(F.gap) + ' 光年' + (F.waveEta !== null ? '（約' + F.waveEta + 'ターン）' : '（引き離し中）'))
     );
     box.appendChild(bar);
     box.appendChild(info);
@@ -141,37 +207,45 @@
     );
   }
 
+  function nets(F) {
+    const refScale = F.refIn > 0 ? Math.min(1, (S.mat + F.matProd + F.harvest.mat) / F.refIn) : 1;
+    return {
+      mat: F.matProd + F.harvest.mat - F.refIn * refScale,
+      fuel: F.harvest.fuel + F.refOut * refScale + F.scoopOut - F.fuelUse,
+      rp: F.rpProd + F.harvest.rp
+    };
+  }
+
   function renderStats(F) {
     const box = $('stats');
     box.textContent = '';
-    const foodNet = F.foodProd - F.foodCons;
-    const refScale = F.refIn > 0 ? Math.min(1, (S.mat + F.matProd) / F.refIn) : 1;
-    const fuelNet = F.refOut * refScale + F.scoopOut - F.fuelUse;
-    const matNet = F.matProd - F.refIn * refScale;
-    const powerShort = F.powerDemand > F.powerGen + 1e-9;
-    const etaTurns = F.speed > 0 ? Math.ceil((D.RULES.totalDistance - S.dist) / F.speed) : null;
-
-    box.appendChild(stat('人口', fmt(S.pop) + ' / ' + fmt(F.cap), S.pop > F.cap ? '収容超過！' : '空き ' + fmt(F.cap - S.pop),
-      { cls: S.pop > F.cap ? 'bad' : '', subcls: S.pop > F.cap ? 'bad' : '', title: '居住区の収容力は、酸素が届いていて電力のある居住区の合計です。' }));
+    const n = nets(F);
+    const popSub = F.overflow > 0 ? 'あふれ ' + F.overflow + '人！' : F.births > 0.05 ? '増加 約+' + fmt(F.births, 1) + '/T' : (F.support - S.pop > 0 ? '空き ' + (F.support - S.pop) + '人' : '満員');
+    box.appendChild(stat('人口', fmt(S.pop) + ' / ' + fmt(F.support), popSub, {
+      cls: F.overflow > 0 ? 'bad' : '', subcls: F.overflow > 0 ? 'bad' : F.births > 0.05 ? 'good' : '',
+      title: '住人 / 住める人数（空気と食料の届いている居住ブロックの合計）'
+    }));
     const mt = F.moraleTarget;
-    box.appendChild(stat('士気', fmt(S.morale), '目標 ' + fmt(mt) + (mt > S.morale + 0.5 ? ' ↑' : mt < S.morale - 0.5 ? ' ↓' : ''),
-      { cls: S.morale < 30 ? 'bad' : S.morale >= 75 ? 'good' : '', title: '士気は目標値へ少しずつ近づきます：\n' + F.moraleParts.map(p => p[0] + ' ' + signed(p[1], 0)).join('\n') }));
-    box.appendChild(stat('食料', fmt(S.food) + ' / ' + fmt(F.capMat.food), signed(foodNet) + ' /ターン',
-      { cls: foodNet < 0 ? (S.food < -foodNet * 5 ? 'bad' : 'warn') : '', subcls: foodNet < 0 ? 'bad' : 'good',
-        title: '生産 ' + fmt(F.foodProd, 1) + ' − 消費 ' + fmt(F.foodCons, 1) + '（1人あたり' + D.RULES.foodPerPerson + '）' }));
-    const fuelLeft = fuelNet < 0 ? Math.floor(S.fuel / -fuelNet) : null;
-    box.appendChild(stat('燃料', fmt(S.fuel) + ' / ' + fmt(F.capMat.fuel), signed(fuelNet) + (fuelLeft !== null ? '（残' + fuelLeft + 'T）' : ' /ターン'),
-      { cls: fuelNet < 0 && fuelLeft < 12 ? 'bad' : fuelNet < 0 ? 'warn' : '', subcls: fuelNet < 0 ? 'bad' : 'good',
-        title: '消費 ' + fmt(F.fuelUse, 1) + '（炉・推進器）／精製 ' + fmt(F.refOut * refScale, 1) + '／星雲ガス ' + fmt(F.scoopOut, 1) }));
-    box.appendChild(stat('資材', fmt(S.mat) + ' / ' + fmt(F.capMat.mat), signed(matNet) + ' /ターン',
-      { subcls: matNet < 0 ? 'bad' : 'good', title: 'ドローン採取 ' + fmt(F.matProd, 1) + '／精製所への投入 ' + fmt(F.refIn * refScale, 1) }));
-    box.appendChild(stat('電力', fmt(F.powerUse, 1) + ' / ' + fmt(F.powerGen, 1), powerShort ? '不足 ' + fmt(F.powerDemand - F.powerGen, 1) : '余剰 ' + fmt(F.powerGen - F.powerUse, 1),
-      { cls: powerShort ? 'bad' : '', subcls: powerShort ? 'bad' : 'good', title: '使用 / 発電（艦橋の補助電源' + D.RULES.basePower + 'を含む）。不足すると優先度の低い区画から停止します。' }));
-    box.appendChild(stat('人手', fmt(F.workersReq) + ' / ' + fmt(S.pop), F.workersReq > S.pop ? '不足 ' + fmt(F.workersReq - S.pop) : '余裕 ' + fmt(S.pop - F.workersReq),
-      { cls: F.workersReq > S.pop ? 'warn' : '', subcls: F.workersReq > S.pop ? 'bad' : '', title: '稼働中の区画に必要な人手 / 人口。足りない場合は優先度の低い区画から効率が落ちます。' }));
-    box.appendChild(stat('研究', fmt(S.rp), signed(F.rpProd) + ' /ターン', { subcls: 'good' }));
-    box.appendChild(stat('速度', fmt(F.speed, 1) + ' 光年', etaTurns !== null ? '到着まで約' + etaTurns + 'T' : '停泊中',
-      { title: '速度 = ' + D.RULES.drift + ' + ' + D.RULES.speedK + ' × 推力 ' + fmt(F.thrust, 1) + ' ÷ 質量 ' + fmt(F.mass, 1) }));
+    box.appendChild(stat('士気', fmt(S.morale), '目標 ' + fmt(mt) + (mt > S.morale + 0.5 ? ' ↑' : mt < S.morale - 0.5 ? ' ↓' : ''), {
+      cls: S.morale < 35 ? 'bad' : S.morale >= 70 ? 'good' : '',
+      title: '士気は住人の快適さの平均（目標）へ少しずつ近づきます。35未満で暴動、70以上で人口増加・研究が上向き。'
+    }));
+    box.appendChild(stat('資材', fmt(S.mat) + ' / ' + fmt(F.capMat.mat), signed(n.mat) + ' /ターン', { subcls: n.mat < 0 ? 'bad' : n.mat > 0 ? 'good' : '' }));
+    const fuelLeft = n.fuel < 0 ? Math.floor(S.fuel / -n.fuel) : null;
+    box.appendChild(stat('燃料', fmt(S.fuel) + ' / ' + fmt(F.capMat.fuel), signed(n.fuel) + (fuelLeft !== null ? '（残' + fuelLeft + 'T）' : ' /ターン'), {
+      cls: fuelLeft !== null && fuelLeft < 10 ? 'bad' : fuelLeft !== null && fuelLeft < 20 ? 'warn' : '',
+      subcls: n.fuel < 0 ? 'bad' : 'good', title: '消費 ' + fmt(F.fuelUse, 1) + '（炉→推進系の順に回る）'
+    }));
+    box.appendChild(stat('研究', fmt(S.rp), signed(n.rp) + ' /ターン', { subcls: 'good', title: '住人が研究を生む。研究ラボの近くに住むほど多い。' }));
+    box.appendChild(stat('速度', fmt(F.speed, 1) + ' 光年', '衝撃波は ' + fmt(F.waveSpeed, 1), {
+      cls: S.mode !== 'orbit' && F.speed < F.waveSpeed ? 'warn' : '', subcls: S.mode !== 'orbit' && F.speed < F.waveSpeed ? 'bad' : '',
+      title: '速度 = ' + D.RULES.drift + ' + 推力。衝撃波は少しずつ加速する。'
+    }));
+    box.appendChild(stat('衝撃波', F.gap <= 0 ? '呑まれている' : fmt(F.gap) + ' 光年', F.waveEta !== null ? '約' + F.waveEta + 'ターンで到達' : '引き離し中', {
+      cls: F.gap <= 0 || (F.waveEta !== null && F.waveEta <= 4) ? 'bad' : F.waveEta !== null && F.waveEta <= 10 ? 'warn' : '',
+      subcls: F.waveEta !== null ? 'bad' : 'good'
+    }));
+    box.appendChild(stat('作業', S.ap + ' / ' + F.apMax, '建造・修理・改修など', { title: '工房1つにつき+1（最大' + D.RULES.maxAp + '）' }));
   }
 
   function renderToolbar() {
@@ -182,109 +256,169 @@
       onclick: () => setTool(type)
     }, label);
     box.appendChild(tb('inspect', '調べる', '区画をクリックして詳細を表示'));
-    box.appendChild(tb('repair', '修理', '耐久+' + D.RULES.repairAmount + '・故障を直す（資材' + D.RULES.repairCost + '・作業1）'));
-    box.appendChild(tb('demolish', '撤去', 'モジュールを撤去して資材を一部回収（作業1）'));
+    box.appendChild(tb('repair', '修理', '故障を直して再稼働（資材' + D.RULES.repairCost + '・作業1）。老朽化はそのまま'));
+    box.appendChild(tb('overhaul', '改修', '寿命を新品に戻す（建造費の40%・作業1・数ターン停止）'));
+    box.appendChild(tb('demolish', '撤去', 'モジュールを撤去して資材を一部回収（作業1）。区画は居住ブロックに戻る'));
     box.appendChild(tb('expand', '外殻拡張', '船体の外側に区画を増やす（資材' + G.expandCost(S) + '・作業1）'));
     if (tool.type === 'build') {
       const def = D.MODULES[tool.id];
-      box.appendChild(el('span', { class: 'toolnote' }, '建造：', el('b', { style: 'color:' + def.color }, def.name), '（配置先をクリック／Escで解除）'));
+      box.appendChild(el('span', { class: 'toolnote' }, '建造：', el('b', { style: 'color:' + def.color }, def.name), '（置きたい区画にマウスを乗せると効果を予測／Escで解除）'));
     }
     box.appendChild(el('span', { class: 'spacer' }));
-    const ov = (key, label) => el('button', {
-      type: 'button', class: 'btn tool small' + (overlay === key ? ' on' : ''),
-      onclick: () => { overlay = overlay === key ? 'none' : key; render(); }
-    }, label);
-    box.appendChild(ov('o2', '酸素範囲'));
-    box.appendChild(ov('shield', 'シールド範囲'));
+    box.appendChild(el('button', { type: 'button', class: 'btn tool small', disabled: canUndo() ? null : true, title: 'このターンの操作をすべて取り消す（Ctrl+Z）', onclick: undo }, '↶ やり直す'));
   }
 
-  function cellLabel(m) {
-    const st = { active: '', building: '建造中', broken: '故障', off: '停止', blocked: '配置不適' }[m.status];
-    return m.def.name + (st ? '（' + st + '）' : '');
+  function renderOverlayBar() {
+    const box = $('overlaybar');
+    box.textContent = '';
+    box.appendChild(el('span', { class: 'muted small' }, '範囲表示'));
+    const ob = (key, label, color) => el('button', {
+      type: 'button', class: 'btn chip' + (overlay === key ? ' on' : ''), role: 'radio', 'aria-checked': overlay === key ? 'true' : 'false',
+      style: color ? '--chip:' + color : null,
+      onclick: () => { overlay = overlay === key ? 'none' : key; render(); }
+    }, label);
+    box.appendChild(ob('none', 'なし'));
+    for (const f of D.FIELD_ORDER) box.appendChild(ob(f, D.FIELDS[f].name, D.FIELDS[f].color));
+    box.appendChild(ob('shield', 'シールド', '#63b3ed'));
+  }
+
+  function fieldValue(F, i) {
+    if (overlay === 'shield') return F.shield[i] ? 1 : 0;
+    return F.fields[overlay] ? F.fields[overlay][i] : 0;
   }
 
   function renderGrid(F) {
     const grid = $('grid');
     grid.textContent = '';
     grid.style.gridTemplateColumns = 'repeat(' + S.cols + ', 1fr)';
+    cellEls = [];
+    let maxV = 1;
+    if (overlay !== 'none') for (let i = 0; i < S.hull.length; i++) if (S.hull[i]) maxV = Math.max(maxV, Math.abs(fieldValue(F, i)));
+    const blockAt = {};
+    for (const b of F.blocks) blockAt[b.i] = b;
+
     for (let i = 0; i < S.rows * S.cols; i++) {
       const [r, c] = G.rc(S, i);
       const inHull = S.hull[i];
       const m = F.info[i];
+      const b = blockAt[i];
       const classes = ['cell'];
-      let title = '';
       const kids = [];
+      let label = '';
       if (!inHull) {
         classes.push('void');
+        label = '船外';
         if (tool.type === 'expand') {
           const chk = G.canExpand(S, r, c);
-          if (chk.ok) { classes.push('can'); kids.push(el('span', { class: 'plus' }, '+')); title = '外殻を拡張（資材' + G.expandCost(S) + '）'; }
-          else title = chk.reason;
+          if (chk.ok) { classes.push('can'); kids.push(el('span', { class: 'plus' }, '+')); label = '外殻を拡張できる'; }
         }
-      } else if (!m) {
-        classes.push('empty');
-        title = '空き区画';
-        if (G.isRear(S, S.hull, r, c)) { classes.push('rear'); title += '（船尾）'; }
-        else if (G.isEdge(S, S.hull, r, c)) { classes.push('edge'); title += '（外縁）'; }
-        if (tool.type === 'build') {
-          const chk = G.canBuild(S, r, c, tool.id);
-          classes.push(chk.ok ? 'can' : 'cannot');
-          if (!chk.ok) title += ' — ' + chk.reason;
-        }
-      } else {
+      } else if (b) {
+        classes.push('blk');
+        if (b.support <= 0) classes.push('nosupport');
+        if (b.occ > 0 && b.occ >= b.support) classes.push('full');
+        if (b.dark) classes.push('dark');
+        kids.push(el('span', { class: 'glyph blkicon' }, iconOf('block')));
+        kids.push(el('span', { class: 'occ' }, el('b', null, String(b.occ)), '/' + b.support));
+        const cmf = Math.round(b.comfort);
+        kids.push(el('span', { class: 'cmfbar', title: '快適 ' + cmf }, el('i', { class: cmf < 30 ? 'low' : cmf >= 70 ? 'high' : 'mid', style: 'width:' + cmf + '%' })));
+        if (G.isRear(S, S.hull, r, c)) classes.push('rear');
+        label = '居住ブロック ' + b.occ + '/' + b.support + '人・快適' + cmf;
+        if (tool.type === 'build') classes.push(G.canBuild(S, r, c, tool.id).ok ? 'can' : 'cannot');
+      } else if (m) {
         classes.push('mod', 'st-' + m.status);
-        if (m.status === 'active' && !m.powered) classes.push('nopower');
+        if (m.status === 'active' && m.eff < 1 && !(m.def.emit && m.def.emit.power)) classes.push(m.eff > 0 ? 'lowpower' : 'nopower');
         if (m.def.kind === 'engine' && m.out > 0) classes.push('thrusting');
-        title = cellLabel(m);
+        if (m.def.fixed) classes.push('fixed');
         kids.push(el('span', { class: 'glyph', style: 'color:' + m.def.color }, iconOf(m.id)));
         kids.push(el('span', { class: 'mname' }, m.def.name));
-        const cond = Math.max(0, Math.min(100, m.cell.cond));
-        const condCls = cond < 30 ? 'low' : cond < 60 ? 'mid' : 'ok';
-        kids.push(el('span', { class: 'cond' }, el('i', { class: condCls, style: 'width:' + cond + '%' })));
+        if (!m.def.fixed) {
+          const w = Math.min(1, G.wearLevel(S, m.cell));
+          kids.push(el('span', { class: 'wear', title: '老朽度 ' + Math.round(w * 100) + '%' }, el('i', { class: w >= 0.85 ? 'low' : w >= D.RULES.wearStart ? 'mid' : 'ok', style: 'width:' + Math.round(w * 100) + '%' })));
+        }
         const badges = [];
-        if (m.status === 'building') badges.push(el('b', { class: 'bdg build', title: '完成まで' + m.cell.build + 'ターン' }, '⏳' + m.cell.build));
-        if (m.status === 'broken') badges.push(el('b', { class: 'bdg bad', title: '故障中' }, '✖'));
-        if (m.status === 'off') badges.push(el('b', { class: 'bdg', title: '手動で停止中' }, '⏸'));
-        if (m.status === 'blocked') badges.push(el('b', { class: 'bdg bad', title: '配置条件を満たしていない' }, '⛔'));
-        if (m.status === 'active' && !m.powered) badges.push(el('b', { class: 'bdg warn', title: '電力不足' }, '⚡'));
-        if (m.status === 'active' && m.staff < 1) badges.push(el('b', { class: 'bdg warn', title: '人手不足' }, '人'));
-        if (m.def.kind === 'hab' && m.status === 'active' && F.o2[i] <= 0) { badges.push(el('b', { class: 'bdg bad', title: '酸素が届いていない' }, 'O₂')); classes.push('noair'); }
+        if (m.status === 'building') badges.push(el('b', { class: 'bdg build' }, '⏳' + m.cell.build));
+        if (m.status === 'overhaul') badges.push(el('b', { class: 'bdg build' }, '🔧' + m.cell.overhaul));
+        if (m.status === 'broken') badges.push(el('b', { class: 'bdg bad' }, '✖'));
+        if (m.status === 'off') badges.push(el('b', { class: 'bdg' }, '⏸'));
+        if (m.status === 'blocked') badges.push(el('b', { class: 'bdg bad' }, '⛔'));
+        if (m.status === 'active' && m.eff < 1 && !(m.def.emit && m.def.emit.power)) badges.push(el('b', { class: 'bdg warn' }, '⚡'));
         if (badges.length) kids.push(el('span', { class: 'badges' }, badges));
+        label = m.def.name + '・' + statusText(m);
         if (tool.type === 'repair') classes.push(G.canRepair(S, r, c).ok ? 'can' : 'cannot');
-        if (tool.type === 'demolish') classes.push('can-demolish');
-        title += ' 耐久' + Math.round(cond) + '%';
+        if (tool.type === 'overhaul') classes.push(G.canOverhaul(S, r, c).ok ? 'can' : 'cannot');
+        if (tool.type === 'demolish') classes.push(G.canDemolish(S, r, c).ok ? 'can-demolish' : 'cannot');
+        if (tool.type === 'build') classes.push('cannot');
       }
-      if (overlay === 'o2' && inHull && F.o2[i] > 0) classes.push('ov-o2');
-      if (overlay === 'shield' && inHull && F.shield[i] > 0) classes.push('ov-shield');
+      if (overlay !== 'none' && inHull) {
+        const v = fieldValue(F, i);
+        if (v) {
+          const col = overlay === 'shield' ? '#63b3ed' : (overlay === 'comfort' && v < 0 ? '#ff6b6b' : D.FIELDS[overlay].color);
+          const a = Math.round(Math.min(1, Math.abs(v) / maxV) * 0x44 + 0x10).toString(16).padStart(2, '0');
+          classes.push('ov');
+          kids.push(el('span', { class: 'ovval', style: 'color:' + col }, overlay === 'shield' ? '防護' : fmt(v)));
+          kids.push(el('span', { class: 'ovtint', style: 'background:' + col + a }));
+        }
+      }
       if (selected === i) classes.push('sel');
       const btn = el('button', {
-        type: 'button', class: classes.join(' '), title,
-        'aria-label': '(' + (r + 1) + ',' + (c + 1) + ') ' + (title || '船外'),
+        type: 'button', class: classes.join(' '),
+        'aria-label': '(' + (r + 1) + ',' + (c + 1) + ') ' + label,
         onclick: () => onCell(i),
-        onmouseenter: () => hoverInfo(i),
+        onmouseenter: () => onHover(i),
+        onfocus: () => onHover(i),
         oncontextmenu: (e) => { e.preventDefault(); if (tool.type !== 'inspect') setTool('inspect'); }
       }, kids);
+      cellEls.push(btn);
       grid.appendChild(btn);
     }
+    grid.onmouseleave = () => onHover(null);
+    if (hoverIdx !== null) onHover(hoverIdx);
   }
 
-  function hoverInfo(i) {
+  // マウスを乗せたマスの説明と、建造ツールなら効果範囲のプレビュー
+  function onHover(i) {
+    hoverIdx = i;
+    for (const e of cellEls) e.classList.remove('fp', 'fpc');
     const line = $('hoverline');
+    if (i === null || !S) { line.textContent = ' '; return; }
+    const [r, c] = G.rc(S, i);
+    const pos = '(' + (r + 1) + ',' + (c + 1) + ') ';
+    if (tool.type === 'build' && S.hull[i] && !S.cells[i]) {
+      for (const j of G.footprint(S, tool.id, r, c)) if (cellEls[j] && S.hull[j]) cellEls[j].classList.add('fp');
+      cellEls[i].classList.add('fpc');
+      const p = G.previewBuild(S, r, c, tool.id);
+      line.textContent = '';
+      if (p.powerAt === undefined) { line.appendChild(el('span', { class: 'bad' }, pos + p.reason)); return; }
+      const parts = [];
+      const def = D.MODULES[tool.id];
+      if (p.need > 0) parts.push(el('span', { class: p.powerAt >= p.need ? 'good' : p.powerAt >= p.need / 2 ? 'warn' : 'bad' }, '電力 ' + fmt(p.powerAt) + '/' + p.need + (p.powerAt >= p.need ? ' ✓' : p.powerAt >= p.need / 2 ? '（50%）' : '（不足）')));
+      const delta = (label, v, d, invert) => {
+        if (Math.abs(v) < 0.05) return;
+        parts.push(el('span', { class: (invert ? -v : v) > 0 ? 'good' : 'bad' }, label + ' ' + signed(v, d)));
+      };
+      delta('住める人数', p.support, 0);
+      delta('研究', p.rp, 1);
+      delta('速度', p.speed, 1);
+      delta('士気目標', p.morale, 1);
+      if (p.overflow > 0) parts.push(el('span', { class: 'bad' }, p.overflow + '人があふれる'));
+      line.appendChild(el('span', null, pos + '完成後：'));
+      parts.forEach((x, k) => { if (k) line.appendChild(document.createTextNode('・')); line.appendChild(x); });
+      if (!parts.length) line.appendChild(el('span', { class: 'muted' }, '目に見える変化なし（' + def.name + '）'));
+      if (!p.ok) line.appendChild(el('span', { class: 'bad' }, '　※' + p.reason));
+      return;
+    }
     const F = G.computeFlows(S);
     const m = F.info[i];
-    const [r, c] = G.rc(S, i);
-    let t = '(' + (r + 1) + ',' + (c + 1) + ') ';
-    if (!S.hull[i]) t += '船外';
-    else if (!m) t += '空き区画' + (G.isRear(S, S.hull, r, c) ? '・船尾' : G.isEdge(S, S.hull, r, c) ? '・外縁' : '') + (F.o2[i] > 0 ? '・酸素あり' : '・酸素なし');
-    else t += cellLabel(m) + '　' + outputText(m, F) + '　耐久' + Math.round(m.cell.cond) + '%';
-    line.textContent = t;
+    const b = F.blocks.find(x => x.i === i);
+    if (!S.hull[i]) line.textContent = pos + '船外' + (tool.type === 'expand' ? '　' + (G.canExpand(S, r, c).ok ? '拡張できる（資材' + G.expandCost(S) + '）' : G.canExpand(S, r, c).reason) : '');
+    else if (b) line.textContent = pos + '居住ブロック ' + b.occ + '/' + b.support + '人（定員' + b.cap + '）・空気' + fmt(b.air) + '・食料' + fmt(b.food) + '・快適' + Math.round(b.comfort) + (b.dark ? '・電力なし（暗い）' : '');
+    else if (m) line.textContent = pos + m.def.name + '：' + outputText(m, F) + (m.def.fixed ? '' : '・老朽' + Math.round(G.wearLevel(S, m.cell) * 100) + '%');
   }
 
   function onCell(i) {
     const [r, c] = G.rc(S, i);
     if (tool.type === 'inspect') {
       selected = i; tab = 'info'; render();
-      // 1カラム表示（スマホ等）では詳細パネルが下にあるので見える位置までスクロール
       if (window.matchMedia('(max-width: 900px)').matches) {
         const side = document.querySelector('.side');
         if (side) side.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -293,41 +427,61 @@
     }
     if (tool.type === 'build') {
       const id = tool.id;
-      if (S.cells[i] || !S.hull[i]) {
-        // 既存モジュールや船外をクリックしたら、ツールを解除してその区画を調べる
-        tool = { type: 'inspect', id: null };
-        selected = i; tab = 'info'; render();
-        return;
-      }
+      if (S.cells[i] || !S.hull[i]) { tool = { type: 'inspect', id: null }; selected = i; tab = 'info'; render(); return; }
       if (act(() => G.build(S, r, c, id))) {
         selected = i;
         if (S.ap < 1 || S.mat < D.MODULES[id].cost) { tool = { type: 'inspect', id: null }; render(); }
       }
       return;
     }
-    if (tool.type === 'repair') { if (act(() => G.repair(S, r, c))) selected = i; return; }
-    if (tool.type === 'demolish') { if (act(() => G.demolish(S, r, c))) selected = i; return; }
-    if (tool.type === 'expand') { if (act(() => G.expand(S, r, c))) { selected = i; if (S.ap < 1) setTool('inspect'); } }
+    const run = { repair: G.repair, overhaul: G.overhaul, demolish: G.demolish, expand: G.expand }[tool.type];
+    if (run && act(() => run(S, r, c))) { selected = i; if (S.ap < 1) setTool('inspect'); }
   }
 
   function renderControls(F) {
     const box = $('controls');
     box.textContent = '';
-    const modes = el('div', { class: 'modes', role: 'radiogroup', 'aria-label': '航行モード' });
-    for (const key of ['hold', 'cruise', 'full']) {
-      const md = D.MODES[key];
-      modes.appendChild(el('button', {
-        type: 'button', class: 'btn mode' + (S.mode === key ? ' on' : ''), role: 'radio', 'aria-checked': S.mode === key ? 'true' : 'false',
-        title: md.desc, onclick: () => act(() => G.setMode(S, key))
-      }, md.name));
+    const port = G.currentPort(S);
+    if (port) {
+      const pd = D.PORTS[port.type];
+      const panel = el('div', { class: 'portpanel', style: '--port:' + pd.color });
+      panel.appendChild(el('div', { class: 'phead' }, el('b', null, port.name), el('span', { class: 'muted' }, pd.name + '・停泊中')));
+      const res = (label, left, take) => el('div', { class: 'pres' }, el('span', null, label), el('b', null, fmt(left)), el('small', { class: take > 0 ? 'good' : 'muted' }, take > 0 ? '+' + fmt(take) + '/T' : '—'));
+      panel.appendChild(el('div', { class: 'presrow' },
+        res('資材の埋蔵', port.mat, F.harvest.mat),
+        res('燃料の埋蔵', port.fuel, F.harvest.fuel),
+        port.rp > 0 ? res('研究データ', port.rp, F.harvest.rp) : null));
+      if (F.harvestCap.mat <= 0) panel.appendChild(el('div', { class: 'small bad' }, '降下艇格納庫が動いていないため採取できない'));
+      panel.appendChild(el('div', { class: 'btnrow' },
+        el('button', { type: 'button', class: 'btn on', disabled: true }, 'とどまって採取する'),
+        el('button', { type: 'button', class: 'btn primary', onclick: () => act(() => G.setMode(S, 'cruise')) }, '巡航で出発'),
+        el('button', { type: 'button', class: 'btn', onclick: () => act(() => G.setMode(S, 'full')) }, '全速で出発')
+      ));
+      box.appendChild(panel);
+    } else {
+      const modes = el('div', { class: 'modes', role: 'radiogroup', 'aria-label': '航行モード' });
+      for (const key of ['cruise', 'full']) {
+        const md = D.MODES[key];
+        modes.appendChild(el('button', {
+          type: 'button', class: 'btn mode' + (S.mode === key ? ' on' : ''), role: 'radio', 'aria-checked': S.mode === key ? 'true' : 'false',
+          title: md.desc, onclick: () => act(() => G.setMode(S, key))
+        }, md.name));
+      }
+      box.appendChild(el('div', { class: 'modewrap' }, el('span', { class: 'muted' }, '航行'), modes, el('span', { class: 'modedesc muted' }, D.MODES[S.mode].desc)));
+      const nk = G.nextPortIndex(S);
+      if (nk >= 0) {
+        const p = S.route.ports[nk];
+        const known = G.legIndexAt(S, p.pos) <= G.legIndexAt(S, S.dist) + G.scanRange(S);
+        box.appendChild(el('label', { class: 'skipbox' },
+          el('input', { type: 'checkbox', checked: p.skip ? null : true, onchange: (e) => act(() => G.setSkipNext(S, !e.target.checked)) }),
+          ' 次の寄港地（' + (known ? p.name + '・' + D.PORTS[p.type].name : '未観測') + '）に寄る'));
+      }
     }
-    const apDots = el('div', { class: 'ap', title: '作業回数：建造・修理・撤去・拡張に1回ずつ使う' }, '作業 ');
+    const apDots = el('div', { class: 'ap', title: '作業回数：建造・修理・改修・撤去・拡張に1回ずつ使う' }, '作業 ');
     for (let k = 0; k < F.apMax; k++) apDots.appendChild(el('i', { class: k < S.ap ? 'on' : '' }));
     apDots.appendChild(el('span', null, ' ' + S.ap + '/' + F.apMax));
-    const endBtn = el('button', { type: 'button', class: 'btn primary end', onclick: doEndTurn, title: 'Enterキーでも実行できます' }, 'ターン終了 ▶');
-    box.appendChild(el('div', { class: 'modewrap' }, el('span', { class: 'muted' }, '航行'), modes));
-    box.appendChild(el('div', { class: 'modedesc muted' }, D.MODES[S.mode].desc));
-    box.appendChild(el('div', { class: 'endwrap' }, apDots, endBtn));
+    box.appendChild(el('div', { class: 'endwrap' }, apDots,
+      el('button', { type: 'button', class: 'btn primary end', onclick: doEndTurn, title: 'Enterキーでも実行できます' }, 'ターン終了 ▶')));
   }
 
   /* ---------- サイドパネル ---------- */
@@ -338,50 +492,44 @@
     });
     const body = $('tabbody');
     body.textContent = '';
-    if (tab === 'build') renderBuildTab(body, F);
+    if (tab === 'build') renderBuildTab(body);
     else if (tab === 'research') renderResearchTab(body);
     else renderInfoTab(body, F);
   }
 
   function renderBuildTab(body) {
-    body.appendChild(el('p', { class: 'hint' }, 'モジュールを選んでから、グリッドの空き区画をクリック。建造には作業1回と資材が必要です。'));
+    body.appendChild(el('p', { class: 'hint' }, 'モジュールを選び、空きの居住ブロックに置く（そのマスの住人は他へ移るか、あふれる）。置く前にマスへマウスを乗せると効果を予測できます。'));
     const list = el('div', { class: 'cards' });
     for (const id of D.BUILD_ORDER) {
       const def = D.MODULES[id];
       const unlocked = G.isUnlocked(S, id);
-      if (!unlocked && def.research && !S.researched[def.research]) {
-        // 研究前のモジュールも表示しておく（何が解放されるか分かるように）
-      }
       const afford = S.mat >= def.cost;
       const on = tool.type === 'build' && tool.id === id;
-      const meta = [];
-      meta.push('資材' + def.cost);
-      meta.push(def.build + 'T');
-      if (def.powerGen) meta.push('⚡+' + def.powerGen);
-      if (def.powerUse) meta.push('⚡−' + def.powerUse);
-      if (def.workers) meta.push('人' + def.workers);
+      const meta = ['資材' + def.cost, def.build + 'T'];
+      if (def.need) meta.push('⚡' + def.need);
+      if (def.fuel) meta.push('燃料' + def.fuel);
+      if (def.thrust) meta.push('推力' + def.thrust);
       const pl = G.placementLabel(def.place);
-      const card = el('button', {
+      list.appendChild(el('button', {
         type: 'button',
         class: 'card' + (on ? ' on' : '') + (!unlocked ? ' locked' : '') + (unlocked && !afford ? ' poor' : ''),
-        disabled: !unlocked ? true : null,
-        onclick: () => { setTool('build', id); },
+        disabled: unlocked ? null : true,
+        onclick: () => setTool('build', id),
         title: def.desc
       },
         el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, iconOf(id)),
         el('span', { class: 'cbody' },
           el('span', { class: 'cname' }, def.name, pl ? el('small', { class: 'tag' }, pl) : null),
-          el('span', { class: 'cmeta' }, meta.join('・')),
+          el('span', { class: 'cmeta' }, meta.join('・') + (def.emit ? '　' + emitText(def, true) : '')),
           el('span', { class: 'cdesc' }, unlocked ? def.desc : '🔒 研究「' + D.RESEARCH[def.research].name + '」で解放')
         )
-      );
-      list.appendChild(card);
+      ));
     }
     body.appendChild(list);
   }
 
   function renderResearchTab(body) {
-    body.appendChild(el('p', { class: 'hint' }, '研究ラボが生む研究ポイントで新技術を解放します（作業回数は消費しません）。現在 ', el('b', null, fmt(S.rp)), ' pt'));
+    body.appendChild(el('p', { class: 'hint' }, '住人が生む研究ポイントで新技術を解放します（作業回数は使いません）。現在 ', el('b', null, fmt(S.rp)), ' pt'));
     const list = el('div', { class: 'cards' });
     for (const id of D.RESEARCH_ORDER) {
       const def = D.RESEARCH[id];
@@ -390,10 +538,10 @@
       list.appendChild(el('div', { class: 'card rcard' + (done ? ' done' : '') },
         el('span', { class: 'cbody' },
           el('span', { class: 'cname' }, def.name, el('small', { class: 'tag' }, done ? '研究済み' : def.cost + ' pt')),
-          el('span', { class: 'cdesc' }, def.desc)
+          el('span', { class: 'cdesc' }, def.desc + (def.requires && !done ? '（要：' + D.RESEARCH[def.requires].name + '）' : ''))
         ),
         done ? null : el('button', {
-          type: 'button', class: 'btn small' + (chk.ok ? ' primary' : ''), disabled: chk.ok ? null : true,
+          type: 'button', class: 'btn small' + (chk.ok ? ' primary' : ''), disabled: chk.ok ? null : true, title: chk.ok ? '' : chk.reason,
           onclick: () => act(() => G.research(S, id), '研究完了：' + def.name)
         }, '研究')
       ));
@@ -401,30 +549,15 @@
     body.appendChild(list);
   }
 
-  function outputText(m, F) {
-    const k = m.def.kind;
-    if (m.status === 'building') return '完成まで' + m.cell.build + 'ターン';
-    if (m.status === 'broken') return '故障中（修理が必要）';
-    if (m.status === 'off') return '停止中';
-    if (m.status === 'blocked') return '配置条件（' + G.placementLabel(m.def.place) + '）を満たしていない';
-    if (!m.powered) return '電力不足で停止';
-    switch (k) {
-      case 'hab': return '収容 ' + fmt(m.capEff) + ' / ' + m.def.cap + '人';
-      case 'life': return '周囲1マスに酸素を供給';
-      case 'bio': return '食料 +' + fmt(m.out, 1) + '・周囲1マスに酸素';
-      case 'farm': return '食料 +' + fmt(m.out, 1);
-      case 'reactor': case 'solar': return '発電 +' + fmt(m.gen, 1);
-      case 'engine': return S.mode === 'hold' ? '待機中（停泊）' : '推力 ' + fmt(m.out, 1);
-      case 'storage': return '上限 資材/燃料+' + m.def.store.mat + '・食料+' + m.def.store.food;
-      case 'lab': return '研究 +' + fmt(m.out, 1);
-      case 'shop': return m.eff >= 0.5 ? '作業回数 +1' : '人手不足で機能していない';
-      case 'drone': return '資材 +' + fmt(m.out, 1);
-      case 'refinery': return '資材' + fmt(m.def.refine.in * m.eff, 1) + ' → 燃料' + fmt(m.def.refine.out * m.eff, 1) + (G.sectorDef(S).scoop ? '・ガス回収+' + fmt(m.def.scoop * m.eff, 1) : '');
-      case 'lounge': return '士気の目標 +' + fmt(7 * m.eff, 1);
-      case 'medbay': return '人口増加+50%・疫病を軽減';
-      case 'shield': return '周囲1マスを防護';
-      default: return '';
-    }
+  const kv = rows => el('ul', { class: 'kv' }, rows.filter(Boolean).map(([k, v, cls]) => el('li', { class: cls || '' }, el('span', null, k), el('b', null, v))));
+
+  function sourcesList(F, i, field) {
+    const src = G.fieldBreakdown(S, F, i, field);
+    if (!src.length) return null;
+    return el('div', { class: 'src' }, D.FIELDS[field].name + 'の出どころ：', src.slice(0, 5).map(x => {
+      const [r, c] = G.rc(S, x.i);
+      return el('span', { class: 'srci' }, D.MODULES[x.id].name + '(' + (r + 1) + ',' + (c + 1) + ') ' + signed(x.amount, 0));
+    }));
   }
 
   function renderInfoTab(body, F) {
@@ -432,27 +565,36 @@
     const i = selected;
     const [r, c] = G.rc(S, i);
     const m = F.info[i];
+    const b = F.blocks.find(x => x.i === i);
     const pos = '区画 (' + (r + 1) + ', ' + (c + 1) + ')';
     if (!S.hull[i]) {
       const chk = G.canExpand(S, r, c);
       body.appendChild(el('h3', { class: 'itit' }, '船外 ', el('small', null, pos)));
-      body.appendChild(el('p', null, '外殻を拡張すると、ここを区画として使えるようになります。拡張した区画は質量+' + D.RULES.hullMassPerCell + '。'));
+      body.appendChild(el('p', null, '外殻を拡張すると、ここが新しい居住ブロックになります。'));
       body.appendChild(el('button', { type: 'button', class: 'btn' + (chk.ok ? ' primary' : ''), disabled: chk.ok ? null : true, onclick: () => act(() => G.expand(S, r, c)) }, '外殻拡張（資材' + G.expandCost(S) + '）'));
       if (!chk.ok) body.appendChild(el('p', { class: 'muted small' }, chk.reason));
       body.appendChild(backBtn());
       return;
     }
-    if (!m) {
+    if (b) {
       const tags = [];
       if (G.isRear(S, S.hull, r, c)) tags.push('船尾');
       if (G.isEdge(S, S.hull, r, c)) tags.push('外縁');
-      body.appendChild(el('h3', { class: 'itit' }, '空き区画 ', el('small', null, pos)));
-      body.appendChild(el('ul', { class: 'kv' },
-        el('li', null, el('span', null, '位置'), el('b', null, tags.length ? tags.join('・') : '内部')),
-        el('li', null, el('span', null, '酸素'), el('b', null, F.o2[i] > 0 ? '供給あり' : 'なし')),
-        el('li', null, el('span', null, 'シールド'), el('b', null, F.shield[i] > 0 ? '範囲内' : '範囲外'))
-      ));
-      body.appendChild(el('p', { class: 'muted small' }, '「建造」タブでモジュールを選んでからクリックすると建造できます。'));
+      body.appendChild(el('h3', { class: 'itit' }, el('span', { class: 'cglyph blk' }, iconOf('block')), ' 居住ブロック ', el('small', null, pos + (tags.length ? '・' + tags.join('・') : ''))));
+      const airCap = Math.floor(b.air / D.RULES.airPerPerson + 1e-9), foodCap = Math.floor(b.food / D.RULES.foodPerPerson + 1e-9);
+      const limit = b.support >= b.cap ? '定員' : airCap <= foodCap ? '空気' : '食料';
+      body.appendChild(kv([
+        ['住人', b.occ + ' / ' + b.support + '人（定員' + b.cap + '）'],
+        ['住める人数を決めているもの', limit, b.support < b.cap ? 'neg' : 'pos'],
+        ['空気', fmt(b.air) + '（' + airCap + '人分）', airCap < b.cap ? 'neg' : ''],
+        ['食料', fmt(b.food) + '（' + foodCap + '人分）', foodCap < b.cap ? 'neg' : ''],
+        ['快適', Math.round(b.comfort) + (b.comfort < 30 ? '（不満）' : b.comfort >= 70 ? '（良好）' : ''), b.comfort < 30 ? 'neg' : b.comfort >= 70 ? 'pos' : ''],
+        ['電力', fmt(b.power) + (b.dark ? '（暗い・快適−8）' : '')],
+        ['研究', '+' + fmt(b.rp, 2) + '/ターン（研究支援+' + fmt(b.lab) + '%）'],
+        ['人口増加', b.growth > 0 ? '+' + fmt(b.growth, 2) + '/ターン' : '—'],
+        ['医療・シールド', (b.med > 0 ? '医療+' + fmt(b.med) + '%' : '医療なし') + '・' + (b.shielded ? '防護あり' : '防護なし')]
+      ]));
+      for (const f of ['air', 'food', 'comfort']) { const x = sourcesList(F, i, f); if (x) body.appendChild(x); }
       const quick = el('div', { class: 'quick' });
       for (const id of D.BUILD_ORDER) {
         if (!G.isUnlocked(S, id)) continue;
@@ -464,37 +606,39 @@
           onclick: () => act(() => G.build(S, r, c, id))
         }, el('span', { class: 'qg', style: 'color:' + def.color }, iconOf(id)), el('span', { class: 'qn' }, def.name), el('span', { class: 'qc' }, def.cost)));
       }
-      body.appendChild(el('p', { class: 'small' }, 'ここに直接建造（数字は資材）：'));
+      body.appendChild(el('p', { class: 'small' }, 'ここに建造（数字は資材。住人' + b.occ + '人は他のブロックへ移る）：'));
       body.appendChild(quick);
       body.appendChild(backBtn());
       return;
     }
     const def = m.def;
     body.appendChild(el('h3', { class: 'itit' }, el('span', { class: 'cglyph', style: 'color:' + def.color + ';border-color:' + def.color }, iconOf(m.id)), ' ', def.name, ' ', el('small', null, pos)));
-    const stText = { active: m.powered ? (m.eff < 0.99 && !def.powerGen ? '稼働中（効率' + Math.round(m.eff * 100) + '%）' : '稼働中') : '電力不足で停止', building: '建造中（残り' + m.cell.build + 'ターン）', broken: '故障中', off: '手動で停止中', blocked: '配置条件を満たしていない' }[m.status];
-    const rows = [
-      ['状態', stText],
+    const L = G.lifespan(S, m.id);
+    const w = G.wearLevel(S, m.cell);
+    body.appendChild(kv([
+      ['状態', statusText(m), m.status === 'active' && m.eff >= 1 ? 'pos' : m.status === 'active' && m.eff > 0 ? '' : 'neg'],
       ['出力', outputText(m, F)],
-      ['耐久', Math.round(m.cell.cond) + '%'],
-    ];
-    if (def.powerUse) rows.push(['消費電力', String(def.powerUse)]);
-    if (def.workers) rows.push(['必要人手', fmt(def.workers * (S.researched.automation ? 0.6 : 1), 1) + '人' + (m.staff !== undefined && m.staff < 1 ? '（充足' + Math.round(m.staff * 100) + '%）' : '')]);
-    if (def.fuel) rows.push(['燃料消費', def.fuel + (def.kind === 'engine' ? '×' + D.MODES[S.mode].fuel : '')]);
-    rows.push(['質量', String(def.mass)]);
-    body.appendChild(el('ul', { class: 'kv' }, rows.map(([k, v]) => el('li', null, el('span', null, k), el('b', null, v)))));
+      def.need ? ['電力', fmt(m.power, 1) + ' / 必要' + def.need, m.power >= def.need ? 'pos' : 'neg'] : null,
+      def.fixed ? null : ['老朽度', Math.round(w * 100) + '%（' + fmt(m.cell.age) + ' / 寿命' + fmt(L) + 'ターン）', w >= 0.85 ? 'neg' : ''],
+      def.fixed ? null : ['故障の起きやすさ', fmt(G.breakChance(S, m.cell) * 100, 1) + '% / ターン', w >= D.RULES.wearStart ? 'neg' : ''],
+      def.fuel ? ['燃料', def.fuel + (def.kind === 'engine' || def.kind === 'booster' ? '（全速で2倍）' : '') + '/ターン'] : null,
+      def.emit ? ['範囲', emitText(def)] : null
+    ]));
     if (m.notes.length) body.appendChild(el('p', { class: 'notes' }, '⚠ ' + m.notes.join('・')));
+    if (def.need) { const x = sourcesList(F, i, 'power'); if (x) body.appendChild(x); }
     body.appendChild(el('p', { class: 'desc' }, def.desc));
-
-    const btns = el('div', { class: 'btnrow' });
-    const rep = G.canRepair(S, r, c);
-    btns.appendChild(el('button', { type: 'button', class: 'btn' + (rep.ok ? ' primary' : ''), disabled: rep.ok ? null : true, title: rep.ok ? '' : rep.reason, onclick: () => act(() => G.repair(S, r, c)) }, '修理（資材' + D.RULES.repairCost + '）'));
-    if (m.status !== 'building') {
-      btns.appendChild(el('button', { type: 'button', class: 'btn', onclick: () => act(() => G.toggle(S, r, c)) }, m.cell.enabled ? '停止する' : '稼働させる'));
+    if (!def.fixed) {
+      const btns = el('div', { class: 'btnrow' });
+      const rep = G.canRepair(S, r, c);
+      if (m.cell.broken) btns.appendChild(el('button', { type: 'button', class: 'btn' + (rep.ok ? ' primary' : ''), disabled: rep.ok ? null : true, title: rep.ok ? '' : rep.reason, onclick: () => act(() => G.repair(S, r, c)) }, '修理（資材' + D.RULES.repairCost + '）'));
+      const oh = G.canOverhaul(S, r, c);
+      btns.appendChild(el('button', { type: 'button', class: 'btn' + (oh.ok && w >= D.RULES.wearStart ? ' primary' : ''), disabled: oh.ok ? null : true, title: oh.ok ? '' : oh.reason, onclick: () => act(() => G.overhaul(S, r, c)) }, '改修（資材' + G.overhaulCost(S, m.id) + '・' + G.overhaulTurns(S) + 'T停止）'));
+      if (m.status !== 'building') btns.appendChild(el('button', { type: 'button', class: 'btn', onclick: () => act(() => G.toggle(S, r, c)) }, m.cell.enabled ? '停止する' : '稼働させる'));
+      const dem = G.canDemolish(S, r, c);
+      btns.appendChild(el('button', { type: 'button', class: 'btn danger', disabled: dem.ok ? null : true, title: dem.ok ? '' : dem.reason, onclick: () => act(() => G.demolish(S, r, c)) }, '撤去（資材+' + G.demolishRefund(S, r, c) + '）'));
+      body.appendChild(btns);
+      body.appendChild(el('p', { class: 'muted small' }, '修理は故障を直すだけで老朽化は残ります。改修は数ターン止まりますが、新品同様に戻ります。'));
     }
-    const dem = G.canDemolish(S, r, c);
-    btns.appendChild(el('button', { type: 'button', class: 'btn danger', disabled: dem.ok ? null : true, title: dem.ok ? '' : dem.reason, onclick: () => act(() => G.demolish(S, r, c)) }, '撤去（資材+' + G.demolishRefund(S, r, c) + '）'));
-    body.appendChild(btns);
-    body.appendChild(el('p', { class: 'muted small' }, '「停止する」は作業回数を使いません。電力や人手を他の区画に回したいときに。'));
     body.appendChild(backBtn());
   }
 
@@ -505,42 +649,55 @@
   function renderShipSummary(body, F) {
     body.appendChild(el('h3', { class: 'itit' }, '船の概況'));
     body.appendChild(el('p', { class: 'muted small' }, '区画をクリックすると詳細を表示します。'));
-    const section = (title, rows) => {
-      body.appendChild(el('h4', { class: 'sub' }, title));
-      body.appendChild(el('ul', { class: 'kv' }, rows.map(([k, v, cls]) => el('li', { class: cls || '' }, el('span', null, k), el('b', null, v)))));
-    };
-    section('士気の内訳（目標 ' + fmt(F.moraleTarget) + '）', F.moraleParts.map(p => [p[0], signed(p[1], 0), p[1] < 0 ? 'neg' : 'pos']));
-    const gens = {};
-    gens['艦橋の補助電源'] = D.RULES.basePower;
-    for (const m of F.mods) if (m.gen > 0) gens[m.def.name] = (gens[m.def.name] || 0) + m.gen;
-    section('発電', Object.entries(gens).map(([k, v]) => [k, '+' + fmt(v, 1)]));
-    const unpowered = F.mods.filter(m => m.status === 'active' && !m.powered).map(m => m.def.name);
-    if (unpowered.length) body.appendChild(el('p', { class: 'notes' }, '⚡ 電力不足で停止中：' + unpowered.join('、')));
-    const broken = F.mods.filter(m => m.status === 'broken').map(m => m.def.name);
-    if (broken.length) body.appendChild(el('p', { class: 'notes' }, '✖ 故障中：' + broken.join('、')));
-    const worn = F.mods.filter(m => m.status === 'active' && m.cell.cond < 40).map(m => m.def.name + ' ' + Math.round(m.cell.cond) + '%');
-    if (worn.length) body.appendChild(el('p', { class: 'notes warnc' }, '🔧 劣化が進んでいる：' + worn.join('、')));
-    const sd = G.sectorDef(S);
-    section('現在の宙域：' + sd.name, [
-      ['集光パネル出力', '×' + sd.light],
-      ['ドローン採取', '×' + sd.mine + (S.mode === 'hold' ? '（停泊で×2）' : '')],
-      ['星雲ガス回収', sd.scoop ? '可能' : '不可'],
-      ['イベント発生率', Math.round(sd.event * 100) + '%']
+    const section = (title, rows) => { body.appendChild(el('h4', { class: 'sub' }, title)); body.appendChild(kv(rows)); };
+    const issues = [];
+    const broken = F.mods.filter(m => m.status === 'broken');
+    if (broken.length) issues.push(['✖ 故障中', broken.map(m => m.def.name).join('、'), 'neg']);
+    const low = F.mods.filter(m => m.status === 'active' && m.eff < 1 && !(m.def.emit && m.def.emit.power));
+    if (low.length) issues.push(['⚡ 電力不足', low.map(m => m.def.name).join('、'), 'neg']);
+    const worn = F.mods.filter(m => !m.def.fixed && m.status === 'active' && G.wearLevel(S, m.cell) >= 0.8);
+    if (worn.length) issues.push(['🔧 寿命が近い', worn.map(m => m.def.name + ' ' + Math.round(G.wearLevel(S, m.cell) * 100) + '%').join('、'), 'neg']);
+    const empty = F.blocks.filter(b => b.support <= 0).length;
+    if (empty) issues.push(['居住できないブロック', empty + 'マス（空気か食料が届いていない）']);
+    if (F.overflow) issues.push(['あふれている人', F.overflow + '人（毎ターン一部が失われる）', 'neg']);
+    section('気になること', issues.length ? issues : [['特になし', '順調です', 'pos']]);
+    section('衝撃波', [
+      ['距離', F.gap <= 0 ? '呑まれている' : fmt(F.gap) + ' 光年', F.gap <= 0 ? 'neg' : ''],
+      ['衝撃波の速さ', fmt(F.waveSpeed, 1) + ' 光年/ターン（だんだん速くなる）'],
+      ['船の速さ', fmt(F.speed, 1) + ' 光年/ターン', F.speed < F.waveSpeed ? 'neg' : 'pos'],
+      ['到達まで', F.waveEta !== null ? '約' + F.waveEta + 'ターン' : '引き離し中', F.waveEta !== null && F.waveEta <= 6 ? 'neg' : '']
     ]);
-    section('航行', [
-      ['推力', fmt(F.thrust, 1)],
-      ['質量', fmt(F.mass, 1) + '（外殻' + G.hullCount(S) + 'マス）'],
-      ['速度', fmt(F.speed, 1) + ' 光年/ターン']
+    section('士気（目標 ' + fmt(F.moraleTarget) + '）', F.moraleParts.map(p => [p[0], p[1] < 0 ? signed(p[1], 0) : fmt(p[1]), p[1] < 0 ? 'neg' : '']));
+    const pop = F.blocks.reduce((a, b) => a + b.cap, 0);
+    section('居住', [
+      ['居住ブロック', F.blocks.length + 'マス（定員の合計 ' + pop + '人）'],
+      ['住める人数', F.support + '人'],
+      ['研究', '+' + fmt(F.rpProd, 1) + '/ターン']
     ]);
   }
 
-  /* ---------- 日誌 ---------- */
+  /* ---------- 結果のまとめと日誌 ---------- */
+  function renderSummary() {
+    const box = $('summary');
+    const sm = S.summary;
+    if (!sm) { box.hidden = true; return; }
+    box.hidden = false;
+    box.textContent = '';
+    const item = (label, v, d, invert) => el('span', { class: 'sumi ' + (Math.abs(v) < 0.05 ? '' : ((invert ? -v : v) > 0 ? 'good' : 'bad')) }, label + ' ', el('b', null, signed(v, d || 0)));
+    box.appendChild(el('span', { class: 'sumt' }, 'ターン' + sm.turn + 'の結果'));
+    box.appendChild(item('人口', sm.popDelta));
+    if (sm.births || sm.deaths) box.appendChild(el('span', { class: 'muted small' }, '（誕生' + sm.births + '・死亡' + sm.deaths + '）'));
+    box.appendChild(el('span', { class: 'sumi' }, '前進 ', el('b', null, fmt(sm.dist)), ' 光年'));
+    box.appendChild(item('資材', sm.mat));
+    box.appendChild(item('燃料', sm.fuel));
+    box.appendChild(item('研究', sm.rp));
+  }
+
   function renderLog() {
     const box = $('log');
     box.textContent = '';
-    // ターンは新しい順、同じターン内は起きた順に表示する
     const groups = [];
-    for (const e of S.log.slice(-120)) {
+    for (const e of S.log.slice(-150)) {
       const g = groups[groups.length - 1];
       if (g && g.turn === e.turn) g.items.push(e); else groups.push({ turn: e.turn, items: [e] });
     }
@@ -558,8 +715,9 @@
     const res = G.endTurn(S);
     if (!res.ok) { toast(res.reason, 'bad'); return; }
     lastTurnSeen = turn;
-    selected = (selected !== null && S.hull[selected]) ? selected : null;
     if (tool.type === 'build' && S.mat < D.MODULES[tool.id].cost) tool = { type: 'inspect', id: null };
+    if (selected !== null && !S.hull[selected]) selected = null;
+    snapshot();
     save();
     render();
     const fresh = S.log.slice(before).filter(e => e.kind === 'danger');
@@ -571,23 +729,19 @@
   /* ---------- モーダル ---------- */
   function openModal(kind, build) {
     modalKind = kind;
-    const back = $('modal');
     const box = $('modalbox');
     box.textContent = '';
     box.className = 'modal ' + kind;
     build(box);
-    back.hidden = false;
-    const f = box.querySelector('button.primary, button');
+    $('modal').hidden = false;
+    const f = box.querySelector('button.primary') || box.querySelector('button');
     if (f) f.focus();
   }
-  function closeModal() {
-    modalKind = null;
-    $('modal').hidden = true;
-  }
+  function closeModal() { modalKind = null; $('modal').hidden = true; }
 
   function syncModal() {
     if (!S) return;
-    if (S.status !== 'playing') { if (modalKind !== 'end' && modalKind !== 'end-view' && modalKind !== 'help' && modalKind !== 'menu') showEnd(); return; }
+    if (S.status !== 'playing') { if (!['end', 'end-view', 'help', 'menu'].includes(modalKind)) showEnd(); return; }
     if (S.pendingEvent) { if (modalKind !== 'event') showEvent(); return; }
     if (modalKind === 'event' || modalKind === 'end') closeModal();
   }
@@ -595,7 +749,8 @@
   function showEvent() {
     const pe = S.pendingEvent;
     openModal('event', box => {
-      box.appendChild(el('div', { class: 'mkicker' }, 'ターン ' + S.turn + '・' + G.sectorDef(S).name));
+      const port = G.currentPort(S);
+      box.appendChild(el('div', { class: 'mkicker' }, 'ターン ' + S.turn + '・' + (port ? port.name : D.LEGS[G.currentLeg(S).type].name)));
       box.appendChild(el('h2', null, pe.title));
       box.appendChild(el('p', null, pe.text));
       const list = el('div', { class: 'choices' });
@@ -606,6 +761,7 @@
             const res = G.resolveEvent(S, k);
             if (!res.ok) { toast(res.reason, 'bad'); return; }
             closeModal();
+            snapshot();
             save();
             render();
             if (res.lines && res.lines.length) toast(res.lines[res.lines.length - 1], res.kind === 'danger' ? 'bad' : res.kind === 'good' ? 'good' : '');
@@ -616,43 +772,60 @@
     });
   }
 
+  function readBest() { try { return JSON.parse(storageGet(BEST_KEY) || 'null') || {}; } catch (e) { return {}; } }
+
   function showEnd() {
     const won = S.status === 'won';
-    let best = null;
-    try { best = JSON.parse(storageGet(BEST_KEY) || 'null'); } catch (e) { best = null; }
+    const bests = readBest();
+    const best = bests[S.difficulty];
     let isBest = false;
     if (won && S.score && (!best || S.score.score > best.score)) {
-      storageSet(BEST_KEY, JSON.stringify(Object.assign({ date: new Date().toISOString().slice(0, 10) }, S.score)));
+      bests[S.difficulty] = Object.assign({ date: new Date().toISOString().slice(0, 10) }, S.score);
+      storageSet(BEST_KEY, JSON.stringify(bests));
       isBest = true;
-      best = S.score;
     }
     openModal('end', box => {
-      box.appendChild(el('div', { class: 'mkicker' }, won ? '航海成功' : '航海失敗'));
+      box.appendChild(el('div', { class: 'mkicker' }, (won ? '航海成功' : '航海失敗') + '・' + D.DIFFICULTY[S.difficulty].name));
       box.appendChild(el('h2', null, won ? '新天地ヴェルダに到達' : '方舟の灯が消えた'));
       box.appendChild(el('p', null, S.endReason));
-      const rows = [
-        ['航海ターン', S.turn],
-        ['到着時の人口', S.pop],
-        ['最大人口', S.stats.maxPop],
-        ['誕生', S.stats.born],
-        ['犠牲', S.stats.lost],
-        ['建造数', S.stats.built],
-        ['修理数', S.stats.repaired],
+      box.appendChild(kv([
+        ['航海ターン', String(S.turn - 1)],
+        ['到着時の人口', String(S.pop)],
+        ['最大人口', String(S.stats.maxPop)],
+        ['誕生 / 犠牲', S.stats.born + ' / ' + S.stats.lost],
+        ['寄港', S.stats.ports + 'か所（採取 ' + fmt(S.stats.harvested) + '）'],
+        ['建造 / 修理 / 改修', S.stats.built + ' / ' + S.stats.repaired + ' / ' + S.stats.overhauled],
         ['航行距離', fmt(S.dist) + ' 光年']
-      ];
-      box.appendChild(el('ul', { class: 'kv' }, rows.map(([k, v]) => el('li', null, el('span', null, k), el('b', null, String(v))))));
+      ]));
       if (won && S.score) {
         box.appendChild(el('div', { class: 'score' },
           el('span', { class: 'rank r-' + S.score.rank }, S.score.rank),
-          el('span', null, 'スコア ', el('b', null, fmt(S.score.score)), isBest ? el('em', null, ' 自己ベスト！') : null)
-        ));
-        box.appendChild(el('p', { class: 'muted small' }, 'スコア = 人口×10 + 士気×4 + 早さボーナス（220ターンから1ターン早いごとに15）'));
+          el('span', null, 'スコア ', el('b', null, fmt(S.score.score)), isBest ? el('em', null, ' 自己ベスト！') : null)));
+        box.appendChild(el('p', { class: 'muted small' }, 'スコア =（人口×10 + 士気×3 + 早さボーナス）× 難易度の倍率'));
       }
-      if (best && !isBest) box.appendChild(el('p', { class: 'muted small' }, '自己ベスト：' + best.rank + '（' + fmt(best.score) + '・' + best.turn + 'ターン）'));
+      if (best && !isBest) box.appendChild(el('p', { class: 'muted small' }, 'この難易度の自己ベスト：' + best.rank + '（' + fmt(best.score) + '・' + best.turn + 'ターン）'));
       box.appendChild(el('div', { class: 'btnrow' },
-        el('button', { type: 'button', class: 'btn primary', onclick: () => { closeModal(); startNew(); } }, '新しい航海へ'),
+        el('button', { type: 'button', class: 'btn primary', onclick: () => { closeModal(); showDifficulty(); } }, '新しい航海へ'),
         el('button', { type: 'button', class: 'btn', onclick: () => { modalKind = 'end-view'; $('modal').hidden = true; } }, '船を眺める')
       ));
+    });
+  }
+
+  function showDifficulty() {
+    openModal('diff', box => {
+      box.appendChild(el('h2', null, '難易度を選ぶ'));
+      const bests = readBest();
+      const list = el('div', { class: 'choices' });
+      for (const key of ['easy', 'normal', 'hard']) {
+        const d = D.DIFFICULTY[key];
+        const b = bests[key];
+        list.appendChild(el('button', {
+          type: 'button', class: 'btn choice' + (key === 'normal' ? ' primary' : ''),
+          onclick: () => { closeModal(); startNew(undefined, key); }
+        }, el('b', null, d.name), el('small', null, d.desc + (b ? '（自己ベスト ' + b.rank + '・' + fmt(b.score) + '）' : ''))));
+      }
+      box.appendChild(list);
+      box.appendChild(el('div', { class: 'btnrow center' }, el('button', { type: 'button', class: 'btn ghost', onclick: () => { closeModal(); if (S) syncModal(); else showTitle(); } }, 'もどる')));
     });
   }
 
@@ -661,16 +834,13 @@
     openModal('title', box => {
       box.appendChild(el('div', { class: 'tlogo' }, 'DRIFT ARK'));
       box.appendChild(el('div', { class: 'tsub' }, '世代船グリッド航行記'));
-      box.appendChild(el('p', null, '母星の恒星が膨張を始めた。最後の世代船は、' + D.RULES.totalDistance.toLocaleString('ja-JP') + '光年先の居住可能惑星ヴェルダを目指して旅立つ。'));
-      box.appendChild(el('p', null, '船内のグリッドに居住区・生命維持装置・農場・炉・推進器を配置し、電力・酸素・食料・燃料をやりくりしながら、乗員を生かしたまま目的地へ導こう。'));
+      box.appendChild(el('p', null, '母星の恒星が崩壊を始めた。背後から迫る衝撃波を振り切り、最後の世代船は' + D.RULES.totalDistance.toLocaleString('ja-JP') + '光年先の惑星ヴェルダを目指す。'));
+      box.appendChild(el('p', null, '施設は周囲のマスに電力・空気・食料・快適さを届ける。何も置かないマスに人が住む。配置を練り、寄港地で資源を集め、老いていく船を保ちながら旅を続けよう。'));
       const btns = el('div', { class: 'btnrow center' });
       if (hasSave) btns.appendChild(el('button', { type: 'button', class: 'btn primary', onclick: () => { closeModal(); if (!loadSave()) showTitle(); } }, '続きから'));
-      btns.appendChild(el('button', { type: 'button', class: 'btn' + (hasSave ? '' : ' primary'), onclick: () => { closeModal(); startNew(); } }, '新しい航海'));
+      btns.appendChild(el('button', { type: 'button', class: 'btn' + (hasSave ? '' : ' primary'), onclick: () => { closeModal(); showDifficulty(); } }, '新しい航海'));
       btns.appendChild(el('button', { type: 'button', class: 'btn ghost', onclick: showHelp }, '遊び方'));
       box.appendChild(btns);
-      let best = null;
-      try { best = JSON.parse(storageGet(BEST_KEY) || 'null'); } catch (e) { best = null; }
-      if (best) box.appendChild(el('p', { class: 'muted small center' }, '自己ベスト：ランク' + best.rank + '・スコア' + fmt(best.score) + '（' + best.turn + 'ターン）'));
     });
   }
 
@@ -683,34 +853,35 @@
         box.appendChild(el('ul', { class: 'help' }, items.map(t => el('li', null, t))));
       };
       sec('目的', [
-        '目的地ヴェルダまで' + D.RULES.totalDistance.toLocaleString('ja-JP') + '光年。人口が0になるか、' + D.RULES.maxTurns + 'ターンを過ぎると失敗。',
-        '到着時の人口・士気・ターン数でスコアが決まります。'
+        '目的地ヴェルダまで' + D.RULES.totalDistance.toLocaleString('ja-JP') + '光年。背後から恒星の衝撃波が迫り、だんだん速くなる。追いつかれると船が壊れ、人が失われる。',
+        '人口が0になるか、' + D.RULES.maxTurns + 'ターンを過ぎると失敗。到着時の人口・士気・早さでスコアが決まる。'
       ]);
-      sec('1ターンの流れ', [
-        '作業回数（初期2、工房1つごとに+1・最大5）の範囲で、建造・修理・撤去・外殻拡張を行います。研究と稼働/停止の切り替えは作業回数を使いません。',
-        '「ターン終了」で時間が進み、生産・消費・航行・劣化・イベントが処理されます。'
+      sec('居住ブロックと範囲供給', [
+        '何も置いていない船体マスは「居住ブロック」。定員は20人（研究で30人）。',
+        '施設は周囲のマスに電力・空気・食料・快適さなどを届ける。隣のマスは100%、2マス先は50%、3マス先は25%。',
+        '居住ブロックに住める人数は、届いている空気（1人0.4）と食料（1人0.5）で決まる。住める人数を超えた人はあふれて、毎ターン一部が失われる。',
+        '施設を建てると、そのマスの居住ブロックはなくなる（住人は空きのある別のブロックへ移る）。',
+        '施設は、届いている電力が必要量以上で100%、半分以上で50%、それ未満は止まる。',
+        '炉・推進器などは騒音や排熱で隣の快適さを下げる。ラウンジは上げる。快適さの平均が士気になる。'
       ]);
-      sec('配置のルール', [
-        '居住区は生命維持装置（またはバイオドーム）の周囲1マス（3×3）の中でなければ住めません。',
-        '推進器は「船尾」＝左隣が船外のマスにしか置けません。集光パネルとドローン格納庫は「外縁」のみ。',
-        '隣接ボーナス：水耕農場は生命維持装置の隣で増産、推進器は炉の隣で推力+20%、研究ラボは並べると増産。',
-        '核分裂炉の隣の居住区は排熱で士気が下がります。',
-        '外殻拡張で区画を増やせます。ただし推進器の噴射口や外縁専用モジュールを塞ぐ拡張はできません。'
+      sec('研究と人口', [
+        '研究は住人が生む。研究ラボの近くに住む人ほど多くの研究を生む。',
+        '空きのある快適な居住ブロックでは人口が増える。医務室の範囲ではさらに増えやすい。'
       ]);
-      sec('資源と人', [
-        '電力は優先度の高い区画（生命維持→居住区→農場→推進器…）から順に配られ、足りない区画は停止します。残りで動かせる小さな区画には回されます。',
-        '人口はそのまま人手になります。人手が足りないと、優先度の低い区画から効率が落ちます。',
-        '燃料は炉に優先して回り、残りが推進器へ。精製所で資材から作れるほか、星雲ではガスも集められます。',
-        '資材はドローン格納庫で採取。小惑星帯や恒星系では採取量が増え、停泊すると2倍になります。',
-        'モジュールは使うほど劣化し、耐久が尽きたり30%を切ったりすると故障します。早めに修理を。'
+      sec('寄港と航行', [
+        '航路の途中にある寄港地に着くと停泊する。降下艇格納庫が資材・燃料（ステーションでは研究データも）を採る。埋蔵量には限りがある。',
+        '出発するときは「巡航で出発」か「全速で出発」。次の寄港地に寄らずに通過することもできる。',
+        '速度 = ' + D.RULES.drift + ' + 推力。推進器は船尾（左隣が船外）にしか置けない。推力増幅器を推進器の上下左右に置くと推力+50%。',
+        '全速は推力1.5倍だが、推進器の燃料と老朽化が2倍。'
       ]);
-      sec('速度', [
-        '速度 = ' + D.RULES.drift + ' + ' + D.RULES.speedK + ' × 推力 ÷ 質量。モジュールや外殻を増やすほど船は重くなります。',
-        '航行モード：停泊（進まずドローン2倍）／巡航／全速（推力1.5倍・燃料2.2倍・推進器の劣化2.5倍）。'
+      sec('老朽化と整備', [
+        'モジュールは使うほど老いる。寿命の6割を過ぎると故障しやすくなり、寿命を過ぎるとほぼ毎ターン壊れる。',
+        '「修理」は故障を直すだけ（安い）。「改修」は数ターン止まるが、新品同様に戻る。寄港中の改修がおすすめ。'
       ]);
       sec('操作', [
-        'クリック：区画を調べる／選んだツールを使う。右クリックかEscでツール解除。',
-        'Enter：ターン終了。ステータスにマウスを乗せると内訳が見られます。'
+        'クリック：区画を調べる／選んだツールを使う。建造ツールでマスにマウスを乗せると、完成後の効果を予測できる。',
+        '「範囲表示」で電力・空気・食料などの届き方を色と数字で見られる。',
+        'Enter：ターン終了　Ctrl+Z：このターンの操作をやり直す　Esc：ツール解除'
       ]);
       box.appendChild(el('div', { class: 'btnrow center' }, el('button', {
         type: 'button', class: 'btn primary',
@@ -722,27 +893,25 @@
   function showMenu() {
     openModal('menu', box => {
       box.appendChild(el('h2', null, 'メニュー'));
-      box.appendChild(el('p', { class: 'muted small' }, '航海はターンごと・操作ごとにこのブラウザへ自動保存されています。シード：' + S.seed));
+      box.appendChild(el('p', { class: 'muted small' }, '航海は操作ごとにこのブラウザへ自動保存されます。難易度：' + D.DIFFICULTY[S.difficulty].name + '・シード：' + S.seed));
       box.appendChild(el('div', { class: 'btnrow col' },
         el('button', { type: 'button', class: 'btn primary', onclick: () => { closeModal(); syncModal(); } }, '航海に戻る'),
         el('button', { type: 'button', class: 'btn', onclick: showHelp }, '遊び方'),
-        el('button', {
-          type: 'button', class: 'btn danger', onclick: () => {
-            if (window.confirm('現在の航海を破棄して、新しい航海を始めますか？')) { closeModal(); startNew(); }
-          }
-        }, '新しい航海を始める'),
+        el('button', { type: 'button', class: 'btn danger', onclick: () => { if (window.confirm('現在の航海を破棄して、新しい航海を始めますか？')) { closeModal(); showDifficulty(); } } }, '新しい航海を始める'),
         el('button', { type: 'button', class: 'btn ghost', onclick: () => { closeModal(); showTitle(); } }, 'タイトルへ')
       ));
     });
   }
 
   /* ---------- 開始・読み込み ---------- */
-  function startNew(seed) {
-    S = G.newGame(seed);
+  function startNew(seed, difficulty) {
+    S = G.newGame(seed, difficulty);
     tool = { type: 'inspect', id: null };
     selected = null;
     tab = 'build';
+    overlay = 'none';
     lastTurnSeen = 1;
+    snapshot();
     save();
     render();
   }
@@ -750,9 +919,7 @@
   function loadSave() {
     const raw = storageGet(SAVE_KEY);
     if (!raw) return false;
-    try {
-      S = G.deserialize(raw);
-    } catch (e) {
+    try { S = G.deserialize(raw); } catch (e) {
       toast('セーブデータを読み込めませんでした', 'bad');
       storageDel(SAVE_KEY);
       return false;
@@ -760,6 +927,7 @@
     tool = { type: 'inspect', id: null };
     selected = null;
     lastTurnSeen = S.turn;
+    snapshot();
     render();
     return true;
   }
@@ -770,20 +938,23 @@
     $('btn-menu').addEventListener('click', () => { if (S) showMenu(); else showTitle(); });
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') {
-        if (modalKind === 'help' || modalKind === 'menu') { closeModal(); if (S) syncModal(); else showTitle(); return; }
+        if (modalKind === 'help' || modalKind === 'menu' || modalKind === 'diff') { closeModal(); if (S) syncModal(); else showTitle(); return; }
         if (tool.type !== 'inspect') { setTool('inspect'); return; }
         if (selected !== null) { selected = null; render(); }
         return;
       }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z') && !modalKind) { e.preventDefault(); undo(); return; }
       // Enter はいつでも「ターン終了」（モーダル表示中を除く）。ボタンに焦点があっても誤操作しないよう既定動作を止める
       if (e.key === 'Enter' && !modalKind && S && !e.isComposing) {
+        if (e.target && e.target.tagName === 'INPUT') return;
         e.preventDefault();
         doEndTurn();
       }
     }, true);
-    // URL の ?seed=123 で航路を固定できる（検証用）
+    // URL の ?seed=123&difficulty=hard で航路と難易度を固定できる（検証用）
     const m = /[?&]seed=(-?\d+)/.exec(window.location.search);
-    if (m) { startNew(parseInt(m[1], 10)); return; }
+    const dm = /[?&]difficulty=(easy|normal|hard)/.exec(window.location.search);
+    if (m) { startNew(parseInt(m[1], 10), dm ? dm[1] : 'normal'); return; }
     showTitle();
   }
 
